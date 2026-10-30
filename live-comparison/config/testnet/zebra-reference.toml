@@ -1,0 +1,17 @@
+# Zebra v7.0.0 / e8db87eb69254e0d4eedd058eadd48bdfa09065a; isolated except for authenticated RPC.
+# Replace every /path/to path; use an independently synced state for this node.
+[network]
+network = "Testnet"
+listen_addr = "127.0.0.1:28333"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = false
+
+[state]
+cache_dir = "/path/to/live-comparison/testnet/zebra-reference/state"
+ephemeral = false
+
+[rpc]
+listen_addr = "127.0.0.1:28332"
+cookie_dir = "/path/to/live-comparison/testnet/zebra-reference/rpc"
+enable_cookie_auth = true

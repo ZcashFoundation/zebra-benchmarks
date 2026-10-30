@@ -1,0 +1,23 @@
+# Zakura / c572f8faf88e58dcaefd80ec8e4ed05f2d8643b6; isolated except for authenticated RPC.
+# Replace every /path/to path; use an independently synced state for this node.
+[network]
+network = "Testnet"
+p2p_stack = "legacy"
+listen_addr = "127.0.0.1:29333"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = false
+identity_dir = "/path/to/live-comparison/testnet/zakura/identity"
+
+[state]
+cache_dir = "/path/to/live-comparison/testnet/zakura/state"
+ephemeral = false
+
+[state.storage_mode.pruned]
+tx_retention = 10000
+
+[rpc]
+listen_addr = "127.0.0.1:29332"
+cookie_dir = "/path/to/live-comparison/testnet/zakura/rpc"
+cookie_file_name = ".cookie"
+enable_cookie_auth = true

@@ -1,0 +1,22 @@
+# Bootstrap only: stop this node before switching to zakura.toml.
+# Same state/RPC/identity paths; never run both configurations together.
+# Replace every /path/to path before starting the node.
+[network]
+network = "Testnet"
+p2p_stack = "legacy"
+listen_addr = "0.0.0.0:29333"
+cache_dir = "/path/to/live-comparison/testnet/zakura/network-cache"
+identity_dir = "/path/to/live-comparison/testnet/zakura/identity"
+
+[state]
+cache_dir = "/path/to/live-comparison/testnet/zakura/state"
+ephemeral = false
+
+[state.storage_mode.pruned]
+tx_retention = 10000
+
+[rpc]
+listen_addr = "127.0.0.1:29332"
+cookie_dir = "/path/to/live-comparison/testnet/zakura/rpc"
+cookie_file_name = ".cookie"
+enable_cookie_auth = true

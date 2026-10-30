@@ -1,0 +1,18 @@
+{
+  "v7.0.0": {
+    "source": "e8db87eb69254e0d4eedd058eadd48bdfa09065a",
+    "repository": "https://github.com/ZcashFoundation/zebra",
+    "path": "bin/zebrad-reference",
+    "sha256": "8bf211fb912775a769dc383e37b9114b8380c01fa56f6e8839f1483eacca32a7",
+    "build": "RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zebrad --features default-release-binaries,internal-miner",
+    "note": "Historical reference identity, not a receipt for a fresh build. Replace path and sha256 with your local build receipt."
+  },
+  "optimized-asm": {
+    "source": "89390f741931b5238a8ef94a86810d89b3320f1b",
+    "repository": "https://github.com/ZcashFoundation/zebra",
+    "path": "bin/zebrad-optimized-asm",
+    "sha256": "f43267d0e7d9d084b63eb7af008091d13d42fd14b4b02a21b8691da0849f001f",
+    "build": "RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zebrad --features default-release-binaries,internal-miner,pasta-asm",
+    "note": "Historical optimized identity, not a receipt for a fresh build. Replace path and sha256 with your local build receipt."
+  }
+}

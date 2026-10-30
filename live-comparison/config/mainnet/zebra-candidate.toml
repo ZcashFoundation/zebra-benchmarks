@@ -1,0 +1,17 @@
+# Optimized Zebra / 89390f741931b5238a8ef94a86810d89b3320f1b; isolated except for authenticated RPC.
+# Replace every /path/to path; use an independently synced state for this node.
+[network]
+network = "Mainnet"
+listen_addr = "127.0.0.1:28243"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = false
+
+[state]
+cache_dir = "/path/to/live-comparison/mainnet/zebra-candidate/state"
+ephemeral = false
+
+[rpc]
+listen_addr = "127.0.0.1:28242"
+cookie_dir = "/path/to/live-comparison/mainnet/zebra-candidate/rpc"
+enable_cookie_auth = true

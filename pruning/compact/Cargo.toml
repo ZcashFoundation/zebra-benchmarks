@@ -1,0 +1,8 @@
+[package]
+name = "prune-compact"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Zebra state compaction dependencies, pinned on 2026-10-26.
+rocksdb = { version = "=0.24.0", default-features = false, features = ["bindgen-runtime", "lz4"] }

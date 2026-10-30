@@ -1,0 +1,30 @@
+{
+  "network": "mainnet",
+  "chain_tip": {
+    "height": 3530825,
+    "block_hash": null,
+    "note": "Source node best tip before shutdown, not the stored finalized tip. Determine the replay start from the stopped snapshot; the historical stored tip was 3529825."
+  },
+  "database_format_version": "29.0.0",
+  "database_format_major_version": 29,
+  "producing_zebrad": {
+    "version": "7.0.0",
+    "commit": "e8db87eb69254e0d4eedd058eadd48bdfa09065a"
+  },
+  "archive": {
+    "url": "https://snapshots.zfnd.org/mainnet/20261026/zebrad-state-mainnet-v29-20261026.tar.zst",
+    "filename": "zebrad-state-mainnet-v29-20261026.tar.zst",
+    "size_bytes": 274298923615,
+    "sha256": "5387d71e3aadcb7e98c2725c896e4e471ec151aeaeddbafee7388d1f14cc0763",
+    "compression": "zstd",
+    "extraction_path": "state/v29/mainnet"
+  },
+  "compatibility": {
+    "statement": "Requires a zebrad build supporting this database format, or its migration to the pruning format. Check zebra-state/src/constants.rs for the selected source revision."
+  },
+  "produced_at": "2026-10-26T04:02:04Z",
+  "signing": {
+    "status": "unsigned",
+    "note": "The checksum checks transport integrity, not publisher authenticity or independent chain validation."
+  }
+}
