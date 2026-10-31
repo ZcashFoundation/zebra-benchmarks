@@ -250,14 +250,14 @@ def render(data):
         latest_label = f'Latest block {latest_block["height"]:,}' if latest_block else "Latest block"
         tiles.append(f'<article class="glance-tile" style="--node:{colors[target]};--node-dark:{dark_colors[target]}"><h3>{labels[target]}</h3>'
                      f'<p class="glance-metric">{ms(node["median_ms"])} <small>ms</small></p>'
-                     f'<p>Median of {node["n"]} blocks</p>'
-                     f'<p>Quiet host, all time: <strong>{ms(quiet_node["median_ms"])} ms</strong> ({quiet_node["n"]} blocks)</p>'
+                     f'<p>Median, last 24 h ({node["n"]} blocks)</p>'
+                     f'<p>Quiet host, all records: <strong>{ms(quiet_node["median_ms"])} ms</strong> ({quiet_node["n"]} blocks)</p>'
                      f'<p>{latest_label}: <strong>{ms(latest_ms)} ms</strong></p></article>')
     for target, comparison in glance["comparisons"].items():
         quiet_comparison = quiet["comparisons"][target]
         headline_rows.append(f'<div><p class="glance-ratio">{comparison_text(comparison["ratio"])}</p><p>Optimized Zebra vs {labels[target]}</p>'
                              f'<p><strong>{escape(saving_text(comparison["saving_ms"]))}</strong> (median of {comparison["saving_n"]} blocks)</p>'
-                             f'<p class="note">Quiet host, all time: {comparison_text(quiet_comparison["ratio"])} ({quiet_comparison["saving_n"]} blocks)</p></div>')
+                             f'<p class="note">Quiet host, all records: {comparison_text(quiet_comparison["ratio"])} ({quiet_comparison["saving_n"]} blocks)</p></div>')
     for row in glance["recent"]:
         cells = "".join(f'<td>{ms(row["latency_ms"][target])}</td>' for target in ORDER)
         recent_rows.append(f'<tr><th scope="row" title="{row["hash"]}">{row["height"]:,}</th>'
@@ -270,20 +270,20 @@ def render(data):
     return TEMPLATE.replace("@@CONTENT@@", f'''
 <header><div class="page-heading"><h1>Zebra perf stats</h1><nav class="network-tabs" aria-label="Network">{navigation}</nav></div>
 <p class="note">{"SYNTHETIC DATA — not real measurements · " if data["synthetic"] else ""}Updated {data["generated_at"]}</p></header>
-<section aria-labelledby="glance"><h2 id="glance">Time to accept a new block</h2>
-<p>Every new {network} block goes to all three nodes at once. The numbers are how long each node takes to accept it, over the last 24 hours. “Quiet host” counts only blocks that arrived while no other recorded work ran on the machine.</p>
+<section aria-labelledby="glance"><h2 id="glance">Block submission latency</h2>
+<p>Each new {network} block is submitted to all three nodes concurrently via <code>submitblock</code>. Latency is the RPC round trip of each node's first attempt; speed-ups and savings are medians over the same blocks. Figures cover the last 24 hours unless marked otherwise. Quiet-host figures use only blocks dispatched outside recorded host-load intervals (±30 s).</p>
 <div class="glance-headlines">{"".join(headline_rows)}</div>
 <div class="glance-tiles">{"".join(tiles)}</div>
-<h3>Last 24 hours</h3>
-<p id="glance-chart-status" class="note" role="status">{"No blocks in the last 24 hours. " if not glance["points"] else ""}The chart needs JavaScript.</p>
-<figure><div id="glance-chart" class="chart" role="img" aria-label="Time to accept each block over the last 24 hours"></div><figcaption>Lines are running medians. Shaded: other work on the same machine.</figcaption></figure>
-<div class="table-wrap" tabindex="0" role="region" aria-label="By block size"><table><caption>By block size, all time · median ms</caption><thead><tr><th scope="col">Size</th><th scope="col">Blocks</th>{heads}<th scope="col">Optimized vs Zebra v7.0.0</th><th scope="col">Optimized vs Zakura</th></tr></thead><tbody>{"".join(size_rows)}</tbody></table></div>
-<figure><div id="size-chart" class="chart" role="img" aria-label="Time to accept each block by block size"></div><figcaption>Every block all three nodes accepted, by size.</figcaption></figure>
-<div class="table-wrap" tabindex="0" role="region" aria-label="Latest blocks"><table><caption>Latest 10 blocks · ms</caption><thead><tr><th scope="col">Height</th><th scope="col">kB</th>{heads}<th scope="col">Host</th></tr></thead><tbody>{"".join(recent_rows) or '<tr><td colspan="6">No blocks yet.</td></tr>'}</tbody></table></div></section>
-<section aria-labelledby="how"><h2 id="how">How it works</h2>
-<p>A Zebra node follows {network} and hands each new block to the three nodes with <code>submitblock</code>. The three nodes have no peers and empty mempools, so the time is mostly checking and storing the block. They share one machine with other work.</p>
+<h3>Latency, last 24 h</h3>
+<p id="glance-chart-status" class="note" role="status">{"No blocks in the last 24 hours. " if not glance["points"] else ""}The chart requires JavaScript.</p>
+<figure><div id="glance-chart" class="chart" role="img" aria-label="Submission latency over the last 24 hours"></div><figcaption>Points are individual blocks; lines are rolling medians over 15 blocks. Shading marks recorded host load.</figcaption></figure>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Latency by block size"><table><caption>Median latency by block size, all records (ms)</caption><thead><tr><th scope="col">Size</th><th scope="col">Blocks</th>{heads}<th scope="col">Optimized vs Zebra v7.0.0</th><th scope="col">Optimized vs Zakura</th></tr></thead><tbody>{"".join(size_rows)}</tbody></table></div>
+<figure><div id="size-chart" class="chart" role="img" aria-label="Submission latency by block size"></div><figcaption>Latency against serialized block size for every block accepted by all three nodes, all records.</figcaption></figure>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Latest blocks"><table><caption>Latest 10 blocks (ms)</caption><thead><tr><th scope="col">Height</th><th scope="col">kB</th>{heads}<th scope="col">Host</th></tr></thead><tbody>{"".join(recent_rows) or '<tr><td colspan="6">No blocks yet.</td></tr>'}</tbody></table></div></section>
+<section aria-labelledby="how"><h2 id="how">Method</h2>
+<p>A Zebra feeder follows {network} over P2P and dispatches each new block to the three nodes. The nodes run without peers and with empty mempools, so latency is dominated by block validation and commit. All four nodes share one host with other workloads; recorded host load is shaded and excluded from the quiet-host figures.</p>
 <div class="table-wrap" tabindex="0" role="region" aria-label="Builds"><table><caption>Builds</caption><thead><tr><th scope="col">Node</th><th scope="col">Build</th><th scope="col">Storage</th></tr></thead><tbody>{build_rows}</tbody></table></div>
-<button id="download-csv" type="button">Download every block (CSV)</button></section>
+<button id="download-csv" type="button">Download per-block CSV</button></section>
 ''').replace("@@DATA@@", payload)
 
 
@@ -326,10 +326,10 @@ const logAxis={type:'log',dtick:1,tickformat:'~g',minor:{dtick:'D1',showgrid:tru
 function series(i){return {name:names[i],marker:{color:colors[i],size:5,opacity:.7,symbol:i===0?'diamond':'circle'},line:{color:colors[i],width:2.75,dash:i===0?'dash':'solid'}}}
 const loadShapes=d.load_intervals.map(([a,b])=>({type:'rect',xref:'x',yref:'paper',x0:new Date(a).toISOString(),x1:new Date(b).toISOString(),y0:0,y1:1,fillcolor:theme.text,opacity:.06,line:{width:0},layer:'below'}));
 const glanceTraces=order.map(i=>{const target=d.targets[i], rows=d.glance.points.filter(p=>p[i+3]>0);return {...series(i),type:'scatter',mode:'markers',legendgroup:target,showlegend:false,marker:{...series(i).marker,opacity:.45},x:rows.map(p=>new Date(p[2]).toISOString()),y:rows.map(p=>p[i+3]),customdata:rows.map(p=>[p[0],p[1]/1000]),hovertemplate:'Height %{customdata[0]:,.0f}<br>Size %{customdata[1]:.3f} kB<br>%{y:.3f} ms<br>%{x}<extra>%{fullData.name}</extra>'}});
-glanceTraces.push(...order.map(i=>({...series(i),type:'scatter',mode:'lines',legendgroup:d.targets[i],connectgaps:false,x:d.glance.trend.map(p=>new Date(p[0]).toISOString()),y:d.glance.trend.map(p=>p[i+1]>0?p[i+1]:null),hovertemplate:'Running median (up to 15 blocks)<br>%{y:.3f} ms<br>%{x}<extra>%{fullData.name}</extra>'})));
+glanceTraces.push(...order.map(i=>({...series(i),type:'scatter',mode:'lines',legendgroup:d.targets[i],connectgaps:false,x:d.glance.trend.map(p=>new Date(p[0]).toISOString()),y:d.glance.trend.map(p=>p[i+1]>0?p[i+1]:null),hovertemplate:'Rolling median (15 blocks)<br>%{y:.3f} ms<br>%{x}<extra>%{fullData.name}</extra>'})));
 const sizeTraces=order.map(i=>{const rows=d.points.filter(p=>p[i+3]>0);return {...series(i),type:'scatter',mode:'markers',x:rows.map(p=>p[1]/1000),y:rows.map(p=>p[i+3]),customdata:rows.map(p=>p[0]),hovertemplate:'Height %{customdata:,.0f}<br>%{x:.1f} kB<br>%{y:.3f} ms<extra>%{fullData.name}</extra>'}});
-Promise.all([Plotly.react('glance-chart',glanceTraces,{...layout,xaxis:{...layout.xaxis,type:'date',title:'Time (UTC)',range:d.glance.points.length?[d.glance.chart_start,d.glance.window_end]:undefined},yaxis:{...layout.yaxis,...logAxis,title:'Time to accept (ms)'},shapes:loadShapes},config),
-  Plotly.react('size-chart',sizeTraces,{...layout,xaxis:{...layout.xaxis,title:'Block size (kB)'},yaxis:{...layout.yaxis,...logAxis,title:'Time to accept (ms)'}},config)]).then(()=>{document.getElementById('glance-chart-status').textContent=d.glance.points.length?'':'No blocks in the last 24 hours.'}).catch(()=>{document.getElementById('glance-chart-status').textContent='The charts could not be drawn. The tables have the numbers.'});
+Promise.all([Plotly.react('glance-chart',glanceTraces,{...layout,xaxis:{...layout.xaxis,type:'date',title:'Dispatch time (UTC)',range:d.glance.points.length?[d.glance.chart_start,d.glance.window_end]:undefined},yaxis:{...layout.yaxis,...logAxis,title:'Latency (ms)'},shapes:loadShapes},config),
+  Plotly.react('size-chart',sizeTraces,{...layout,xaxis:{...layout.xaxis,title:'Block size (kB)'},yaxis:{...layout.yaxis,...logAxis,title:'Latency (ms)'}},config)]).then(()=>{document.getElementById('glance-chart-status').textContent=d.glance.points.length?'':'No blocks in the last 24 hours.'}).catch(()=>{document.getElementById('glance-chart-status').textContent='The charts could not be rendered; the tables contain the same figures.'});
 }
 const scheme=window.matchMedia('(prefers-color-scheme: dark)');
 renderCharts(scheme.matches);
