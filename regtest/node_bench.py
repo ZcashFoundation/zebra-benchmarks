@@ -451,7 +451,7 @@ def env():
     e = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("ZEBRA", "RUST_LOG", "MALLOC_", "RAYON", "TOKIO"))
+        if not k.startswith(("ZEBRA", "ZAKURA", "RUST_LOG", "MALLOC_", "RAYON", "TOKIO"))
     }
     e.update({"NO_COLOR": "1", "TERM": "dumb", "RAYON_NUM_THREADS": "4"})
     return e

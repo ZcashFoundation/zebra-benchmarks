@@ -298,6 +298,45 @@ class ResumeTests(unittest.TestCase):
     def test_no_miner_submission(self):
         nominer_check()
 
+    def test_burst_times_serial_admission_through_exact_template(self):
+        corpus = [dict(txid='a', raw='aa', bytes=1), dict(txid='b', raw='bb', bytes=1)]
+        fixture = dict(parent='parent', corpus=corpus)
+        calls, admitted = [], []
+        template_calls = 0
+
+        def rpc(method, params=None):
+            nonlocal template_calls
+            calls.append(method)
+            if method == 'sendrawtransaction':
+                self.assertEqual(clock.call_count, 1, 'admission must be inside the timer')
+                tx = corpus[len(admitted)]
+                self.assertEqual(params, [tx['raw']])
+                admitted.append(tx['txid'])
+                return tx['txid']
+            if method == 'getrawmempool':
+                return admitted
+            self.assertEqual(method, 'getblocktemplate')
+            self.assertEqual(admitted, ['a', 'b'])
+            template_calls += 1
+            selected = corpus[:1] if template_calls == 1 else corpus
+            return dict(previousblockhash='parent', sizelimit=2_000_000,
+                        transactions=[dict(hash=tx['txid'], data=tx['raw']) for tx in selected])
+
+        with patch.object(run_sweep, 'Node') as constructor, \
+                patch.object(run_sweep.time, 'perf_counter_ns', side_effect=[100, 900]) as clock, \
+                patch.object(run_sweep.time, 'sleep'):
+            node = constructor.return_value.__enter__.return_value
+            node.rpc.call.side_effect = rpc
+            node.replay.side_effect = lambda chain: self.assertEqual(clock.call_count, 0)
+            node.preload_receipt.return_value = {}
+            row = run_sweep.case('stack', '/unused', Path('/unused'), fixture, [],
+                                 SimpleNamespace(timeout=1, poll_ms=1), 'admission-to-template')
+        self.assertEqual((row['start_ns'], row['end_ns'], row['latency_ns']), (100, 900, 800))
+        self.assertEqual(row['template_polls'], 2)
+        self.assertEqual(row['admitted_transactions'], row['template_transactions'])
+        self.assertEqual(calls, ['sendrawtransaction', 'sendrawtransaction',
+                                'getblocktemplate', 'getrawmempool', 'getblocktemplate'])
+
     @unittest.skipIf(np is None, "numpy is not installed; analysis checks only")
     def test_ablation_analysis(self):
         ablation_check()

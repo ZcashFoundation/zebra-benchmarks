@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import struct
@@ -120,6 +121,27 @@ class PublicationTests(unittest.TestCase):
             with patch.object(sys, 'argv', argv), self.assertRaises(ValueError):
                 probe.main()
             self.assertFalse(output.exists())
+
+    def test_build_receipt_compiler_settings(self):
+        settings = []
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'binary'
+            binary.write_bytes(b'never executed')
+            for script in ('build-arm.sh', 'build-zakura.sh'):
+                source = (campaign.BENCH / script).read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+                with patch.object(sys, 'argv', ['receipt', str(binary), 'a' * 40, script]), \
+                        patch.object(subprocess, 'check_output', return_value='rustc test\nhost: test\n') as compiler, \
+                        patch.dict(os.environ, {'RUSTUP_TOOLCHAIN': '1.97.0', 'RUSTFLAGS': '-C opt-level=3'}, clear=True), \
+                        patch('sys.stdout', io.StringIO()):
+                    exec(compile(source, script, 'exec'), {})
+                compiler.assert_called_once_with(['rustc', '-vV'], text=True)
+                receipt = json.loads(Path(str(binary) + '.build.json').read_text())
+                self.assertEqual(receipt['build'], script)
+                settings.append(receipt['compiler_settings'])
+            self.assertEqual(settings[0], settings[1])
+            self.assertEqual(settings[0]['rustc_verbose_version'], 'rustc test\nhost: test')
+            self.assertEqual(settings[0]['environment']['RUSTFLAGS'], '-C opt-level=3')
+            self.assertIsNone(settings[0]['environment']['CFLAGS'])
 
     def test_shell_usage_never_starts_work(self):
         for script in ('build-arm.sh', 'build-zakura.sh', 'wait-quiet.sh', 'v5-campaign.sh',

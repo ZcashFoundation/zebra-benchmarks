@@ -42,8 +42,8 @@ V5_SOURCES = {
     "startup": "startup/observations.jsonl",
     "replay": "replay-r*/observations.jsonl",
 }
-# Zakura v1.7.0 hit the 600 s timeout in every inclusion repetition; the Zebra arms completed.
-V5_FAILED_ARMS = {"inclusion": "zakura-main"}
+# Only this historical build has the published, documented inclusion timeouts.
+V5_TIMEOUT_SOURCE = "c572f8faf88e58dcaefd80ec8e4ed05f2d8643b6"
 
 
 def style():
@@ -214,6 +214,12 @@ def peer_block(samples, arms=V5_ARMS):
     save(fig, "peer-block", rect=(0, 0, 1, 0.9))
 
 
+def v5_failed_arms(arms):
+    if arms["zakura-main"].get("source") == V5_TIMEOUT_SOURCE:
+        return {"inclusion": "zakura-main"}
+    return {}
+
+
 def v5_campaign(root):
     manifest = json.loads((root / "campaign.json").read_text())
     if manifest.get("profile") == "extended":
@@ -227,7 +233,7 @@ def v5_campaign(root):
         if piece == "empty-gbt" or piece.startswith("empty-admission-"):
             continue
         # v5_receipts confirms that only the documented arm failed.
-        if piece in V5_FAILED_ARMS:
+        if piece in v5_failed_arms(manifest["arms"]):
             continue
         path = root / "completed" / f"{piece}.json"
         if not path.exists() or json.loads(path.read_text()).get("success") is not True:
@@ -429,7 +435,7 @@ def v5_mining(tips, miners, chains, core=False):
         else:
             # These payout modes are unavailable in Zakura with the campaign's NU5 fixtures.
             v5_metric_panels(selected, ("fixture",), miner_labels, metrics, f"tip-miner-{miner}",
-                             arms=V5_ZEBRA, title=title + "\nZakura v1.7.0: n/a for these NU5 fixtures")
+                             arms=V5_ZEBRA, title=title + "\nZakura: n/a for these NU5 fixtures")
     chain_labels = {key: label for key, label in labels.items()
                     if key[0] == "empty-2000" or key[0].endswith("-1900000")}
     for temperature in (("cold",) if core else ("cold", "warm")):
@@ -446,6 +452,7 @@ def render_v5(root, output):
     global OUT
     OUT = output
     arms = v5_campaign(root)
+    failed_arms = v5_failed_arms(arms)
     core = json.loads((root / "campaign.json").read_text()).get("profile") == "core"
     # Load every source before rendering, so absent campaigns cannot silently reuse old figures.
     raw = {source: v5_receipts(root, source,
@@ -453,7 +460,7 @@ def render_v5(root, output):
                              (lambda row: row.get("scenario") == "startup") if source == "startup" else
                              (lambda row: row.get("scenario") == "sync-full") if source == "replay" else
                              (lambda row: row.get("record") == "run") if source == "inclusion" else
-                             (lambda row: True), arms=arms, failed_arm=V5_FAILED_ARMS.get(source))
+                             (lambda row: True), arms=arms, failed_arm=failed_arms.get(source))
            for source in V5_SOURCES}
     sweep = v5_sweep(raw["sweep"], core)
     relays = {}
@@ -506,9 +513,10 @@ def render_v5(root, output):
     v5_metric_panels(raw["inclusion"], ("corpus", "rate"), {("transparent", "100"): "Transparent · 100 tx/s"},
                      (("Measured load CPU, including quiet tail (s)", lambda row: row["cpu_s"]),
                       ("Peak sampled RSS (MiB)", lambda row: row["peak_rss_bytes"] / (1024 * 1024))),
-                     "inclusion-resources", arms=V5_ZEBRA, repetitions=3,
+                     "inclusion-resources", arms=V5_ZEBRA if failed_arms else V5_ARMS, repetitions=3,
                      title="Regtest admission with concurrent template probes · whole load, not per-proof cost"
-                           "\nZakura v1.7.0 omitted: it hit the 600 s timeout in all three repetitions")
+                           + ("\nZakura v1.7.0 omitted: it hit the 600 s timeout in all three repetitions"
+                              if failed_arms else ""))
 
 
 def main(argv=None):

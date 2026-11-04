@@ -112,6 +112,17 @@ def self_test():
         rejects(lambda: f.v5_campaign(root))
         marker.write_text(json.dumps(dict(success=True)))
         assert f.v5_campaign(root) == arms
+        manifest["pieces"].append("inclusion")
+        arms["zakura-main"]["source"] = f.V5_TIMEOUT_SOURCE
+        (root / "campaign.json").write_text(json.dumps(manifest))
+        assert f.v5_failed_arms(arms) == {"inclusion": "zakura-main"}
+        assert f.v5_campaign(root) == arms
+        arms["zakura-main"]["source"] = "f5c20398c629c8179364b07f059da3c814af78ec"
+        (root / "campaign.json").write_text(json.dumps(manifest))
+        assert f.v5_failed_arms(arms) == {}
+        rejects(lambda: f.v5_campaign(root))  # New builds cannot inherit historical failures.
+        (root / "completed/inclusion.json").write_text(json.dumps(dict(success=True)))
+        assert f.v5_campaign(root) == arms
         (root / "rpc").mkdir()
         path = root / "rpc/observations.jsonl"
         row = dict(arm="release", scenario="rpc-load", repetition=0, concurrency=1,

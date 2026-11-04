@@ -2,6 +2,8 @@
 
 Source-only harness for the published Zebra mining and performance measurements. The code reproduces workloads and analysis, not the original machine, randomized fixture bytes or live arrivals. No binaries, node databases, wallet data or historical run directories are included.
 
+For the Zakura v1.8.1 rerun and new Mainnet replay, follow the [v1.8.1 runbook](zakura-1.8.1-RUNBOOK.md). Historical Zakura results below remain v1.7.0 measurements, not new v1.8.1 measurements.
+
 The measurements are distinct: Regtest mining paths; RPC and full-verification replay against Mainnet snapshots; checkpoint sync from local peers; live-network block submission with optional mempool mirroring; and Mainnet storage pruning. Regtest loopback results do not measure Internet propagation, orphan rates or fee revenue.
 
 | Directory | Purpose |
@@ -19,7 +21,7 @@ The harness is licensed **MIT OR Apache-2.0**. Font files retain SIL OFL 1.1; pu
 
 Use Linux and Python 3.11 or newer. The recorded final sync ran Python 3.14. The harness uses `/proc`, process affinity, `taskset`, loopback ports and POSIX signals. Snapshot workflows require a reflink-capable filesystem and deliberately use `cp --reflink=always`, with no full-copy fallback. Install GNU coreutils, Bash, curl, zstd and tar. Fixture generation needs rootless Podman with host networking; signed fixture generation additionally needs `cryptography >=43` with deterministic secp256k1 ECDSA. Plotting needs matplotlib and numpy. No JavaScript build is required for the dashboard; its interactive plot loads Plotly from a CDN.
 
-Node builds need Rust **1.97.0**, a C/C++ toolchain and libclang/bindgen, plus the pinned node's native prerequisites. On non-Apple x86-64, the Pasta assembly feature requires BMI2 and ADX. The two pruning compactors need RocksDB 0.24.0 / librocksdb-sys 0.17.3+10.4.2 with default features disabled and `bindgen-runtime,lz4`.
+Node builds need Rust **1.97.0** and a C/C++ toolchain, plus each pinned node's native prerequisites. Zebra's RocksDB bindings still require libclang/bindgen; Zakura v1.8.1 uses committed bindings and no longer needs libclang. On x86-64, the assembly arms require BMI2 and ADX. The two pruning compactors need RocksDB 0.24.0 / librocksdb-sys 0.17.3+10.4.2 with default features disabled and `bindgen-runtime,lz4`.
 
 The principal measurements used an AMD Ryzen 9 9950X3D: 16 physical cores, 32 logical CPUs. Measured work ran on CPUs `0-7,16-23`, sharing 96 MB L3; replay sources ran on `8-15,24-31`, on the other CCD. The pruning storage measurement ran on a separate machine. Neither is a minimum requirement.
 
@@ -60,9 +62,11 @@ Relative environment overrides resolve from the invoking directory; CLI paths ov
 
 Keep generated outputs outside version control. Generated receipts can contain local paths, system inventories and RPC configuration; review them before publishing. Use dedicated test-only wallets, keep RPC on loopback or a trusted isolated network, and never fund the signed fixture builder's deliberately public key on Mainnet.
 
-## Build the four arms
+## Historical V5 build layout
 
-Use separate clean checkouts and each commit's own lockfile. The builder wrappers write a SHA256/source/build receipt beside each executable; the campaign refuses missing or mismatched receipts.
+The Zebra pins below belong to the historical V5 campaign; the runnable Zakura recipe has been updated to v1.8.1. Running this combination creates new results, not a reproduction of the recorded v1.7.0 measurements. For the current stack `5527c56392`, next `7ae1a82747`, assembly variant and optional extra revision, use the [v1.8.1 runbook](zakura-1.8.1-RUNBOOK.md), including its explicit common compiler environment.
+
+Use separate clean checkouts and each commit's own lockfile. The builder wrappers write a SHA256/source/build receipt beside each executable, including `compiler_settings` with `rustc -vV` and the selected build environment (unset variables are JSON `null`); the campaign refuses missing or mismatched binary receipts. Matching unset variables alone does not establish compiler-profile parity across projects.
 
 ```bash
 git clone https://github.com/ZcashFoundation/zebra.git "$WORK/zebra-reference"
@@ -70,7 +74,7 @@ git -C "$WORK/zebra-reference" checkout --detach e8db87eb69254e0d4eedd058eadd48b
 git clone https://github.com/ZcashFoundation/zebra.git "$WORK/zebra-optimized"
 git -C "$WORK/zebra-optimized" checkout --detach 89390f741931b5238a8ef94a86810d89b3320f1b
 git clone https://github.com/zakura-core/zakura.git "$WORK/zakura-reference"
-git -C "$WORK/zakura-reference" checkout --detach c572f8faf88e58dcaefd80ec8e4ed05f2d8643b6
+git -C "$WORK/zakura-reference" checkout --detach f5c20398c629c8179364b07f059da3c814af78ec
 (cd "$WORK/zebra-reference" && bash "$HARNESS/regtest/build-arm.sh" zebrad-reference)
 (cd "$WORK/zebra-optimized" && bash "$HARNESS/regtest/build-arm.sh" zebrad-optimized)
 (cd "$WORK/zebra-optimized" && ZEBRA_EXTRA_FEATURES=pasta-asm bash "$HARNESS/regtest/build-arm.sh" zebrad-assembly)
@@ -79,14 +83,16 @@ git -C "$WORK/zakura-reference" checkout --detach c572f8faf88e58dcaefd80ec8e4ed0
 
 The Zebra recipe is `RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zebrad --features default-release-binaries,internal-miner`, adding `pasta-asm` only for the assembly arm. The Zakura recipe is `RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zakura --bin zakurad --features default-release-binaries`.
 
+Zakura v1.8.1's `default-release-binaries` now includes `x86_64-asm` and `indexer-rpc` as well as Prometheus and the release INFO log ceiling. Its default x86-64 build requires BMI2 and ADX; do not silently substitute a `portable` build in the same campaign.
+
 | Campaign label | Source commit | Meaning |
 |---|---|---|
 | `release` | `e8db87eb69254e0d4eedd058eadd48bdfa09065a` | Zebra v7.0.0 |
 | `stack` | `89390f741931b5238a8ef94a86810d89b3320f1b` | Optimized Zebra, including upstream cryptography forks |
 | `crypto` | Same optimized commit | Same source plus the opt-in Pasta assembly backend |
-| `zakura-main` | `c572f8faf88e58dcaefd80ec8e4ed05f2d8643b6` | Zakura v1.7.0 reference |
+| `zakura-main` | `f5c20398c629c8179364b07f059da3c814af78ec` | Zakura v1.8.1 reference for new runs |
 
-Both optimized arms contain these public pins; their comparison isolates assembly, not forks versus upstream:
+The historical optimized arms contain these public pins; their comparison isolates assembly, not forks versus upstream. These are not the dependency revisions of the new `5527c56392` stack:
 
 | Dependency | Public repository | Revision |
 |---|---|---|
@@ -97,7 +103,15 @@ Both optimized arms contain these public pins; their comparison isolates assembl
 | Halo 2 proofs, gadgets, Poseidon | [upbqdn/halo2](https://github.com/upbqdn/halo2) | `b27151aaf703f2f6de76e64e0d9b88288a1ba09d` |
 | Sinsemilla | [upbqdn/sinsemilla](https://github.com/upbqdn/sinsemilla) | `f4b18727394db9478bb40da3e8347824d7c152c1` |
 
-Use the exact Zakura commit, not an arbitrary local tag. Its embedded version is `zakurad 1.0.3-rc0+758.gc572f8faf`, despite the v1.7.0 release label. Its manifest pins `zakura-assets = 0.3524060.0`. Regtest uses `p2p_stack = "legacy"`; the native/dual path is not an interchangeable comparison. The fixtures activate upgrades only through NU5: Zakura's later Orchard payout support and lack of Sapling coinbase support must not be turned into invented comparison cells. Zebra databases cannot be opened by Zakura.
+Use the exact Zakura commit, not an arbitrary local tag. The v1.8.1 manifest pins `zakura-assets = 0.3538611.0`. Its embedded version is derived from build-time Git tags/metadata, falling back to the package version; record the actual `--version` output alongside the source/SHA256 receipt rather than inferring it from the release label.
+
+Zakura Regtest retains `[network.network]` / `[network.network.params]` and requires explicit `p2p_stack = "legacy"` for these comparisons; its default is dual-stack outside Mainnet. The fixtures activate upgrades only through NU5. Zakura's coinbase builder rejects Sapling payouts and pays Orchard receivers through Ironwood only from NU6.3, so neither capability supplies a shielded-payout cell under these fixtures.
+
+Do not open a Zebra v29 cache with Zakura: their persisted `BlockInfo` layouts differ despite overlapping format-version numbers. Prepare an independent Zakura state. The harness-used CLI/RPC names and TOML keys remain supported from v1.7.0 to v1.8.1, but that is not a claim of complete cross-project configuration compatibility.
+
+Tracing accepts levels, bare targets and `target=level`; v1.8.1 warns and ignores span/field directives. Keep `info` enabled for startup endpoint discovery. The in-tree Prometheus exporter preserves `[metrics].endpoint_addr`, `zakura_build_info`, underscore-normalized names and cumulative summary `_count`/`_sum`; its recent-window quantiles have changed. The [source compatibility table](zakura-1.8.1-RUNBOOK.md#8-source-compatibility-v170--v181) documents these changes, added keys/metrics, P2P behavior, and pinned source evidence.
+
+Historical results below remain v1.7.0 measurements at `c572f8faf88e58dcaefd80ec8e4ed05f2d8643b6`, with recorded embedded version `zakurad 1.0.3-rc0+758.gc572f8faf` and `zakura-assets = 0.3524060.0`. They are not v1.8.1 results, and their executable hashes are not the expected hashes for the new build.
 
 The recorded reference, assembly and Zakura executable SHA256 values were respectively `8bf211fb912775a769dc383e37b9114b8380c01fa56f6e8839f1483eacca32a7`, `f43267d0e7d9d084b63eb7af008091d13d42fd14b4b02a21b8691da0849f001f` and `9ed3b1cee8b958e7fadaddf604a7644aa3b6456b30fe240ea2c675e4eff8372a`. The default optimized arm's final hash was not recovered. Matching source and recipe does not promise bit-identical binaries: native library/linker versions and inherited build flags were not fully recorded.
 
@@ -387,7 +401,8 @@ python3 -B live-comparison/smoke_regtest.py \
 The retained source checks do not require node databases or running nodes:
 
 ```bash
-for directory in regtest/sweep regtest/relay initial-sync pruning live-comparison figures; do
+python3 -B regtest/v5_campaign.py --self-test
+for directory in regtest regtest/sweep regtest/relay initial-sync pruning live-comparison figures; do
   (cd "$directory" && python3 -B -m unittest)
 done
 python3 -B -m doctest initial-sync/phase-summary.py

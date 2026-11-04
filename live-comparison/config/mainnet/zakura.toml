@@ -1,4 +1,4 @@
-# Zakura / c572f8faf88e58dcaefd80ec8e4ed05f2d8643b6; isolated except for the dispatcher's P2P observer and authenticated RPC.
+# Zakura v1.8.1 / f5c20398c629c8179364b07f059da3c814af78ec; isolated except for the dispatcher's P2P observer and authenticated RPC.
 # Replace every /path/to path and miner address; bind only on a trusted LAN and firewall both ports to the dispatcher host.
 [network]
 network = "Mainnet"
