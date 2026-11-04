@@ -44,8 +44,11 @@ class ComparisonTests(unittest.TestCase):
         with patch.dict(os.environ, {'V5_CPUS': 'all'}):
             whole_host = campaign.campaign_plan(self.arms, Path('/unused'), 'comparison')
         self.assertTrue(all('taskset' not in command for commands, _ in whole_host.values() for command in commands))
+        self.assertIn('extra-mempool',
+                      campaign.parse_arms([*self.specs, 'extra-mempool:zebrad-mempool'], 'comparison'))
         for specs in (self.specs[:-1], self.specs + [self.specs[0]],
-                      ['andale:../bad', *self.specs[:2], self.specs[-1]]):
+                      ['andale:../bad', *self.specs[:2], self.specs[-1]],
+                      [*self.specs, 'extra:zebrad-extra'], [*self.specs, 'extra-Bad:zebrad-extra']):
             with self.assertRaises(ValueError):
                 campaign.parse_arms(specs, 'comparison')
 

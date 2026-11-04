@@ -50,7 +50,9 @@ ENDPOINTS = {'admission': 'admission-to-template', 'prepared': 'prepared-submitb
 def parse_arms(specs, profile='core'):
     arms = {}
     for spec in specs:
-        labels = 'stack|crypto|andale|zakura-main' if profile == 'comparison' else 'release|stack|crypto|zakura-main'
+        # Comparison runs may add `extra-NAME` Zebra arms; their sources come from build receipts.
+        labels = ('stack|crypto|andale|zakura-main|extra-[a-z0-9-]+' if profile == 'comparison'
+                  else 'release|stack|crypto|zakura-main')
         if not re.fullmatch(rf'({labels}):(?:[A-Za-z0-9_.-]+|<binary>)', spec):
             raise ValueError('Expected label:binary-name for this profile: ' + spec)
         label, binary = spec.split(':')
