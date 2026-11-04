@@ -33,8 +33,8 @@ export BENCH_SIGNED_FIXTURES="$HARNESS/fixtures/zakura-1.8.1/signed"
 export V5_CPUS=0-7,16-23
 export SOURCE_CPUS=8-15,24-31
 export QUIET_DEVICE=nvme0n1
-export ZEBRA_REPO="$WORK/zebra-source"
-export ZAKURA_REPO="$WORK/zakura-source"
+export ZEBRA_REPO="${ZEBRA_REPO:-https://github.com/ZcashFoundation/zebra.git}"
+export ZAKURA_REPO="${ZAKURA_REPO:-https://github.com/zakura-core/zakura.git}"
 export ARCHIVE="$HARNESS/snapshots/source-state-clean"
 mkdir -p "$WORK" "$BENCH_BINS" "$BENCH_OUTPUT" "$BENCH_MAINNET"
 
@@ -76,10 +76,10 @@ change compiler or linker settings without appearing in the receipts.
 
 | Label | Immutable source | Binary | Feature difference |
 |---|---|---|---|
-| `stack` | `5527c563929fbe3b9e82d099b4d4cfc19b092e20` | `zebrad-stack` | Zebra release features + `internal-miner` |
+| `stack` | `1c60fe3f00f6e5326411d786465ba540d191d709` | `zebrad-stack` | Zebra release features + `internal-miner` |
 | `crypto` | same as `stack` | `zebrad-crypto` | same source + `pasta-asm` |
 | `zakura-main` | `f5c20398c629c8179364b07f059da3c814af78ec` | `zakurad-1.8.1` | Zakura `default-release-binaries` |
-| `extra` (optional replay only) | explicit full 40-character `EXTRA_REVISION` | `zebrad-extra` | same Zebra recipe as `stack`, without `pasta-asm` |
+| `extra` (optional) | explicit full 40-character `EXTRA_REVISION` | `zebrad-extra` | same Zebra recipe as `stack`, without `pasta-asm` |
 
 The names identify this campaign, not equivalence to another publisher's build.
 Zakura's default release features include `x86_64-asm`, `indexer-rpc`, Prometheus,
@@ -87,15 +87,15 @@ and an INFO compile-time log ceiling; do not silently add `portable`.
 
 ## 2. Build and seal binaries
 
-Use fresh clean clones; do not change existing working checkouts. The source
-repositories above must contain the pinned objects. Public clone URLs are
-`https://github.com/ZcashFoundation/zebra.git` and
-`https://github.com/zakura-core/zakura.git`; local clones also preserve access to
-pinned commits available only in the supplied source repositories.
+Use fresh clean clones; do not change existing working checkouts. The public
+source repositories are `https://github.com/ZcashFoundation/zebra.git` and
+`https://github.com/zakura-core/zakura.git`. Fetch the pinned stack from Zebra's
+`bench/zakura-1.8.1-stack` branch before checking out its commit:
 
 ```bash
 git clone --no-hardlinks "$ZEBRA_REPO" "$WORK/zebra-stack"
-git -C "$WORK/zebra-stack" checkout --detach 5527c563929fbe3b9e82d099b4d4cfc19b092e20
+git -C "$WORK/zebra-stack" fetch https://github.com/ZcashFoundation/zebra bench/zakura-1.8.1-stack
+git -C "$WORK/zebra-stack" checkout --detach 1c60fe3f00f6e5326411d786465ba540d191d709
 git clone --no-hardlinks "$ZAKURA_REPO" "$WORK/zakura"
 git -C "$WORK/zakura" checkout --detach f5c20398c629c8179364b07f059da3c814af78ec
 (cd "$WORK/zebra-stack" && bash "$HARNESS/regtest/build-arm.sh" zebrad-stack)
@@ -170,9 +170,8 @@ as proof of its stored finalized tip. Keep the original archive unchanged.
 source, commits blocks into the target, and compares their bytes/hashes; it is
 not a reflink or full cryptographic re-verification of the prefix. The
 [stack implementation][copy-stack] supports read-only access to compatible v29
-state and produces its own current format. [Pinned next][copy-next] has the same
-CLI. Prepare each distinct Zebra revision using its own executable rather than
-assuming that a newer stack database can be opened by next.
+state and produces its own current format. Prepare each distinct Zebra revision
+using its own executable rather than assuming database compatibility.
 
 ```bash
 export PREP="$BENCH_OUTPUT/state-preparation"
@@ -435,8 +434,8 @@ same arm. The sender has no miner but may learn transactions through gossip.
 Regtest uses legacy TCP, transparent payout, and fixtures with upgrades through
 NU5. The [Zakura coinbase builder][zakura-coinbase] rejects Sapling payout and
 pays an Orchard receiver through Ironwood only from NU6.3; neither supplies a
-shielded-payout cell under these fixtures. The optional `extra` arm applies to
-Mainnet replay, not this fixed four-arm Regtest profile.
+shielded-payout cell under these fixtures. The comparison profile requires
+`stack`, `crypto` and `zakura-main` and permits additional `extra-NAME` Zebra arms.
 
 Each measured piece writes `summary.json` with per-arm sample counts,
 median/min/max, actual block bytes and transaction counts, selected metric, and
@@ -500,17 +499,16 @@ contains the complete release entries; the harness-relevant differences are:
 | Builds, assets, support | RocksDB 0.24.4 uses committed bindings and omits unused bundled features, without changing Zakura's on-disk format. Default x86-64 builds enable Pasta assembly with a startup BMI2/ADX check; `portable` overrides it. `indexer-rpc` becomes optional but stays default. Assets change from `0.3524060.0` to `0.3538611.0`. Embedded version depends on build metadata; record `--version`. The release supports Mainnet through height 3,643,309, above this window. See [manifest][zakura-manifest], [features][zakura-features], [build metadata][zakura-build-metadata], and [changelog][zakura-changelog]. |
 
 [announcement]: https://zakura.com/announcements/zakura-1-8-0/
-[zebra-manifest]: https://github.com/ZcashFoundation/zebra/blob/5527c563929fbe3b9e82d099b4d4cfc19b092e20/Cargo.toml
+[zebra-manifest]: https://github.com/ZcashFoundation/zebra/blob/1c60fe3f00f6e5326411d786465ba540d191d709/Cargo.toml
 [zakura-manifest]: https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/Cargo.toml
-[copy-stack]: https://github.com/ZcashFoundation/zebra/blob/5527c563929fbe3b9e82d099b4d4cfc19b092e20/zebrad/src/commands/copy_state.rs
-[copy-next]: https://github.com/ZcashFoundation/zebra/blob/7ae1a827471235e8d14204e2aaa77dc9b61ca25c/zebrad/src/commands/copy_state.rs
-[zebra-codec]: https://github.com/ZcashFoundation/zebra/blob/5527c563929fbe3b9e82d099b4d4cfc19b092e20/zebra-state/src/service/finalized_state/disk_format/chain.rs
+[copy-stack]: https://github.com/ZcashFoundation/zebra/blob/1c60fe3f00f6e5326411d786465ba540d191d709/zebrad/src/commands/copy_state.rs
+[zebra-codec]: https://github.com/ZcashFoundation/zebra/blob/1c60fe3f00f6e5326411d786465ba540d191d709/zebra-state/src/service/finalized_state/disk_format/chain.rs
 [zakura-codec]: https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/crates/zakura-state/src/service/finalized_state/disk_format/chain.rs
 [zakura-upgrades]: https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/crates/zakura-state/src/service/finalized_state/disk_format/upgrade.rs
 [zakura-format]: https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/crates/zakura-state/src/constants.rs
-[zebra-router]: https://github.com/ZcashFoundation/zebra/blob/5527c563929fbe3b9e82d099b4d4cfc19b092e20/zebra-consensus/src/router.rs
+[zebra-router]: https://github.com/ZcashFoundation/zebra/blob/1c60fe3f00f6e5326411d786465ba540d191d709/zebra-consensus/src/router.rs
 [zakura-router]: https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/crates/zakura-consensus/src/router.rs
-[zebra-rpc]: https://github.com/ZcashFoundation/zebra/blob/5527c563929fbe3b9e82d099b4d4cfc19b092e20/zebra-rpc/src/methods.rs
+[zebra-rpc]: https://github.com/ZcashFoundation/zebra/blob/1c60fe3f00f6e5326411d786465ba540d191d709/zebra-rpc/src/methods.rs
 [zakura-rpc]: https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/crates/zakura-rpc/src/methods.rs
 [zakura-changelog]: https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/CHANGELOG.md#181---2026-11-03
 [zakura-defaults]: https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/crates/zakurad/src/commands/default_config.toml

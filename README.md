@@ -64,7 +64,7 @@ Keep generated outputs outside version control. Generated receipts can contain l
 
 ## Historical V5 build layout
 
-The Zebra pins below belong to the historical V5 campaign; the runnable Zakura recipe has been updated to v1.8.1. Running this combination creates new results, not a reproduction of the recorded v1.7.0 measurements. For the current stack `5527c56392`, next `7ae1a82747`, assembly variant and optional extra revision, use the [v1.8.1 runbook](zakura-1.8.1-RUNBOOK.md), including its explicit common compiler environment.
+The Zebra pins below belong to the historical V5 campaign; the runnable Zakura recipe has been updated to v1.8.1. Running this combination creates new results, not a reproduction of the recorded v1.7.0 measurements. For the current three-arm stack/crypto/Zakura comparison, see the [v1.8.1 runbook](zakura-1.8.1-RUNBOOK.md): its Zebra stack is `1c60fe3f00` from the public `bench/zakura-1.8.1-stack` branch, with an explicit common compiler environment.
 
 Use separate clean checkouts and each commit's own lockfile. The builder wrappers write a SHA256/source/build receipt beside each executable, including `compiler_settings` with `rustc -vV` and the selected build environment (unset variables are JSON `null`); the campaign refuses missing or mismatched binary receipts. Matching unset variables alone does not establish compiler-profile parity across projects.
 
@@ -92,7 +92,7 @@ Zakura v1.8.1's `default-release-binaries` now includes `x86_64-asm` and `indexe
 | `crypto` | Same optimized commit | Same source plus the opt-in Pasta assembly backend |
 | `zakura-main` | `f5c20398c629c8179364b07f059da3c814af78ec` | Zakura v1.8.1 reference for new runs |
 
-The historical optimized arms contain these public pins; their comparison isolates assembly, not forks versus upstream. These are not the dependency revisions of the new `5527c56392` stack:
+The historical optimized arms contain these public pins; their comparison isolates assembly, not forks versus upstream. These are not the dependency revisions of the new `1c60fe3f00` stack:
 
 | Dependency | Public repository | Revision |
 |---|---|---|

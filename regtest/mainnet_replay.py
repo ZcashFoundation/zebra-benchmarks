@@ -26,8 +26,10 @@ from measure import block_check, load, require
 
 START, END = 3_505_700, 3_538_560
 SOURCES = {
-    'stack': '5527c563929fbe3b9e82d099b4d4cfc19b092e20',
-    'crypto': '5527c563929fbe3b9e82d099b4d4cfc19b092e20',
+    # The stack base plus the mined-block notification drain fix, without which a peerless replay
+    # stops accepting submitted blocks after about 10,000.
+    'stack': '1c60fe3f00f6e5326411d786465ba540d191d709',
+    'crypto': '1c60fe3f00f6e5326411d786465ba540d191d709',
     'zakura-main': 'f5c20398c629c8179364b07f059da3c814af78ec',
 }
 PROFILE_SETTINGS = dict(

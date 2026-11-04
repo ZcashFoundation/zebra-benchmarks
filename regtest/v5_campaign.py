@@ -37,8 +37,8 @@ RELEASES = {'release': 'e8db87eb69254e0d4eedd058eadd48bdfa09065a',
             'zakura-main': 'f5c20398c629c8179364b07f059da3c814af78ec'}
 LABELS = ('release', 'stack', 'crypto', 'zakura-main')
 COMPARISON_REVISIONS = {
-    'stack': '5527c563929fbe3b9e82d099b4d4cfc19b092e20',
-    'crypto': '5527c563929fbe3b9e82d099b4d4cfc19b092e20',
+    'stack': '1c60fe3f00f6e5326411d786465ba540d191d709',
+    'crypto': '1c60fe3f00f6e5326411d786465ba540d191d709',
     'zakura-main': RELEASES['zakura-main'],
 }
 SIZES = (25000, 100000, 250000, 500000, 1000000, 1500000, 1900000)
