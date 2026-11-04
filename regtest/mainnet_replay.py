@@ -36,18 +36,18 @@ PROFILE_SETTINGS = dict(
     PANIC='unwind', INCREMENTAL='false', DEBUG_ASSERTIONS='false', OVERFLOW_CHECKS='false')
 
 
-def validate_arms(arms, extra_revision=None):
+def validate_arms(arms, extras=None):
     sources = dict(SOURCES)
-    if extra_revision is not None:
-        require(re.fullmatch(r'[0-9a-f]{40}', extra_revision) is not None,
-                '--extra-revision must be a full commit hash')
-        sources['extra'] = extra_revision
+    for label, revision in (extras or {}).items():
+        require(label not in sources and re.fullmatch(r'[0-9a-f]{40}', revision or '') is not None,
+                f'--extra {label}: needs a new label and a full commit hash')
+        sources[label] = revision
     require({arm.label for arm in arms} == sources.keys(),
             'provide exactly these arms: ' + ', '.join(sources))
     for arm in arms:
         require(arm.provenance.get('source') == sources[arm.label], 'wrong source pin: ' + arm.label)
         recipe = arm.provenance.get('build', '')
-        require(bool(recipe) and (arm.label == 'extra' or
+        require(bool(recipe) and (arm.label not in SOURCES or
                 ('pasta-asm' in recipe) == (arm.label == 'crypto')),
                 'incorrect Pasta feature build receipt: ' + arm.label)
     compiler = arms[0].provenance.get('compiler_settings')
@@ -189,7 +189,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--provenance', type=Path, required=True)
     parser.add_argument('--arm', action='append', default=[], metavar='LABEL=BINARY')
-    parser.add_argument('--extra-revision', help='full source hash for an optional fifth Zebra arm named extra')
+    parser.add_argument('--extra', action='append', default=[], metavar='LABEL=REVISION',
+                        help='optional extra Zebra arm built from this full commit; repeatable')
     parser.add_argument('--snapshot', action='append', default=[], metavar='LABEL=CACHE_ROOT')
     parser.add_argument('--corpus', type=Path, required=True, help='pruning fetch output/blocks')
     parser.add_argument('--output', type=Path, required=True, help='new directory; never overwritten')
@@ -201,7 +202,12 @@ def main(argv=None):
     parser.add_argument('--smoke', action='store_true', help='10 blocks, one run/arm; not a comparison')
     args = parser.parse_args(argv)
     arms = load_arms(args.provenance, args.arm)
-    sources = validate_arms(arms, args.extra_revision)
+    extras = {}
+    for spec in args.extra:
+        label, separator, revision = spec.partition('=')
+        require(separator and label not in extras, 'invalid/duplicate --extra: ' + spec)
+        extras[label] = revision
+    sources = validate_arms(arms, extras)
     snapshots = {}
     for spec in args.snapshot:
         label, separator, path = spec.partition('=')

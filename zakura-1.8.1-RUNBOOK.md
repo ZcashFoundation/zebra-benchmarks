@@ -308,8 +308,10 @@ replay_args=(
   --snapshot "zakura-main=$BENCH_MAINNET/zakura-main-3505700"
   --corpus "$CORPUS" --cpus "$V5_CPUS"
 )
+# Each extra arm needs `--extra LABEL=REVISION`, a binary and a snapshot; repeat for more arms,
+# e.g. one per performance change to attribute each one's effect.
 if [[ -n ${EXTRA_REVISION:-} ]]; then
-  replay_args+=(--extra-revision "$EXTRA_REVISION"
+  replay_args+=(--extra "extra=$EXTRA_REVISION"
     --arm "extra=$BENCH_BINS/zebrad-extra"
     --snapshot "extra=$BENCH_MAINNET/extra-3505700")
 fi

@@ -21,10 +21,8 @@ class ReplayContracts(unittest.TestCase):
                 'RUST_LOG': 'error', 'PATH': '/preserved'}, clear=True):
             self.assertEqual(clean_env(), {'PATH': '/preserved', 'NO_COLOR': '1', 'TERM': 'dumb'})
 
-    def arms(self, extra=False):
-        sources = dict(replay.SOURCES)
-        if extra:
-            sources['extra'] = 'a' * 40
+    def arms(self, extras=None):
+        sources = dict(replay.SOURCES, **(extras or {}))
         environment = {'CARGO_PROFILE_RELEASE_' + key: value
                        for key, value in replay.PROFILE_SETTINGS.items()}
         environment['RUSTFLAGS'] = '-C codegen-units=1'
@@ -36,14 +34,16 @@ class ReplayContracts(unittest.TestCase):
     def test_sources_features_and_compiler_parity(self):
         arms = self.arms()
         self.assertEqual(replay.validate_arms(arms), replay.SOURCES)
-        extra = self.arms(extra=True)
-        self.assertEqual(replay.validate_arms(extra, 'a' * 40)['extra'], 'a' * 40)
-        for changed, revision, message in (
+        two = {'extra': 'a' * 40, 'sapling': 'c' * 40}
+        extra = self.arms(two)
+        self.assertEqual(replay.validate_arms(extra, two)['sapling'], 'c' * 40)
+        for changed, extras, message in (
                 (extra, None, 'exactly these arms'),
-                (arms, 'short', 'full commit hash'),
-                (extra, 'b' * 40, 'wrong source pin')):
+                (arms, {'extra': 'short'}, 'full commit hash'),
+                (arms, {'stack': 'a' * 40}, 'new label'),
+                (extra, dict(two, extra='b' * 40), 'wrong source pin')):
             with self.assertRaisesRegex(RuntimeError, message):
-                replay.validate_arms(changed, revision)
+                replay.validate_arms(changed, extras)
         changed = copy.deepcopy(arms)
         changed[0].provenance['build'] += ' --features pasta-asm'
         with self.assertRaisesRegex(RuntimeError, 'Pasta feature'):
@@ -163,10 +163,11 @@ class ReplayContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / 'output'
-            arms = self.arms(extra=True)
+            arms = self.arms({'extra': 'a' * 40, 'sapling': 'c' * 40})
             blocks = [dict(height=replay.START + 1, hash='abc')]
             argv = ['--provenance', str(root / 'unused.json'), '--corpus', str(root),
-                    '--output', str(output), '--extra-revision', 'a' * 40, '--smoke']
+                    '--output', str(output), '--extra', 'extra=' + 'a' * 40,
+                    '--extra', 'sapling=' + 'c' * 40, '--smoke']
             for arm in arms:
                 argv.extend(['--snapshot', f'{arm.label}={root / arm.label}'])
                 (root / arm.label).mkdir()
@@ -187,11 +188,11 @@ class ReplayContracts(unittest.TestCase):
                 self.assertFalse(output.exists())
                 replay.main([*argv, '--exclusive'])
             affinity.assert_called_once_with(0, [8])
-            self.assertEqual(replay_run.call_count, 5)
+            self.assertEqual(replay_run.call_count, 6)
             manifest = json.loads((output / 'campaign.json').read_text())
-            self.assertEqual(manifest['order'], [list(replay.SOURCES) + ['extra']])
+            self.assertEqual(manifest['order'], [list(replay.SOURCES) + ['extra', 'sapling']])
             self.assertTrue(manifest['exclusive'])
-            self.assertIn('extra', json.loads((output / 'summary.json').read_text()))
+            self.assertIn('sapling', json.loads((output / 'summary.json').read_text()))
 
 
 if __name__ == '__main__':
