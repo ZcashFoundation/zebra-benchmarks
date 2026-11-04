@@ -17,6 +17,7 @@ Environment:
   P2P_PORT         28233 (public Mainnet listener)
   SAMPLE_SECONDS   60; state size is sampled every tenth observation
   STARTUP_TIMEOUT  1200 seconds for RPC readiness
+  INITIAL_PEERS    Optional comma-separated HOST:PORT list replacing the Mainnet seeds
 Requires Linux, curl, GNU coreutils, Python 3.11+, and a reflink-capable filesystem.
 Re-running the same directory clears its STOP marker and appends samples/logs.
 Prepare replay inputs with successive STOP_AT=1750000 and STOP_AT=2316084 runs;
@@ -53,6 +54,7 @@ sha256sum "$bin" >"$run/binary.sha256"
 "$bin" generate -o "$run/zebrad.toml"
 python3 -B - "$root/regtest" "$run" "$rpc" "${P2P_PORT:-28233}" "${STOP_AT:-}" <<'PY'
 import json
+import os
 from pathlib import Path
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -72,6 +74,11 @@ edits = [
 ]
 if stop_at:
     edits.append(("state", "debug_stop_at_height", stop_at))
+if os.environ.get("INITIAL_PEERS"):
+    peers = os.environ["INITIAL_PEERS"].split(",")
+    edits.append(("network", "initial_mainnet_peers", json.dumps(peers)))
+    # Loopback feeders share one IP; allow a connection to each of them.
+    edits.append(("network", "max_connections_per_ip", str(max(len(peers), 1))))
 for section, key, value in edits:
     text = set_key(text, section, key, value)
 path.write_text(text)
