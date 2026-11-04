@@ -47,7 +47,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertIn('extra-mempool',
                       campaign.parse_arms([*self.specs, 'extra-mempool:zebrad-mempool'], 'comparison'))
         for specs in (self.specs[:-1], self.specs + [self.specs[0]],
-                      ['andale:../bad', *self.specs[:2], self.specs[-1]],
+                      ['stack:../bad', *self.specs[1:]],
                       [*self.specs, 'extra:zebrad-extra'], [*self.specs, 'extra-Bad:zebrad-extra']):
             with self.assertRaises(ValueError):
                 campaign.parse_arms(specs, 'comparison')

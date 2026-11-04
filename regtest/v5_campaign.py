@@ -39,7 +39,6 @@ LABELS = ('release', 'stack', 'crypto', 'zakura-main')
 COMPARISON_REVISIONS = {
     'stack': '5527c563929fbe3b9e82d099b4d4cfc19b092e20',
     'crypto': '5527c563929fbe3b9e82d099b4d4cfc19b092e20',
-    'andale': '7ae1a827471235e8d14204e2aaa77dc9b61ca25c',
     'zakura-main': RELEASES['zakura-main'],
 }
 SIZES = (25000, 100000, 250000, 500000, 1000000, 1500000, 1900000)
@@ -51,7 +50,7 @@ def parse_arms(specs, profile='core'):
     arms = {}
     for spec in specs:
         # Comparison runs may add `extra-NAME` Zebra arms; their sources come from build receipts.
-        labels = ('stack|crypto|andale|zakura-main|extra-[a-z0-9-]+' if profile == 'comparison'
+        labels = ('stack|crypto|zakura-main|extra-[a-z0-9-]+' if profile == 'comparison'
                   else 'release|stack|crypto|zakura-main')
         if not re.fullmatch(rf'({labels}):(?:[A-Za-z0-9_.-]+|<binary>)', spec):
             raise ValueError('Expected label:binary-name for this profile: ' + spec)

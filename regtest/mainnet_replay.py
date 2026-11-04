@@ -28,7 +28,6 @@ START, END = 3_505_700, 3_538_560
 SOURCES = {
     'stack': '5527c563929fbe3b9e82d099b4d4cfc19b092e20',
     'crypto': '5527c563929fbe3b9e82d099b4d4cfc19b092e20',
-    'andale': '7ae1a827471235e8d14204e2aaa77dc9b61ca25c',
     'zakura-main': 'f5c20398c629c8179364b07f059da3c814af78ec',
 }
 PROFILE_SETTINGS = dict(

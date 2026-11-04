@@ -78,7 +78,6 @@ change compiler or linker settings without appearing in the receipts.
 |---|---|---|---|
 | `stack` | `5527c563929fbe3b9e82d099b4d4cfc19b092e20` | `zebrad-stack` | Zebra release features + `internal-miner` |
 | `crypto` | same as `stack` | `zebrad-crypto` | same source + `pasta-asm` |
-| `andale` | `7ae1a827471235e8d14204e2aaa77dc9b61ca25c` | `zebrad-andale` | pinned Zebra next, not an arbitrary moving branch |
 | `zakura-main` | `f5c20398c629c8179364b07f059da3c814af78ec` | `zakurad-1.8.1` | Zakura `default-release-binaries` |
 | `extra` (optional replay only) | explicit full 40-character `EXTRA_REVISION` | `zebrad-extra` | same Zebra recipe as `stack`, without `pasta-asm` |
 
@@ -97,14 +96,11 @@ pinned commits available only in the supplied source repositories.
 ```bash
 git clone --no-hardlinks "$ZEBRA_REPO" "$WORK/zebra-stack"
 git -C "$WORK/zebra-stack" checkout --detach 5527c563929fbe3b9e82d099b4d4cfc19b092e20
-git clone --no-hardlinks "$ZEBRA_REPO" "$WORK/zebra-andale"
-git -C "$WORK/zebra-andale" checkout --detach 7ae1a827471235e8d14204e2aaa77dc9b61ca25c
 git clone --no-hardlinks "$ZAKURA_REPO" "$WORK/zakura"
 git -C "$WORK/zakura" checkout --detach f5c20398c629c8179364b07f059da3c814af78ec
 (cd "$WORK/zebra-stack" && bash "$HARNESS/regtest/build-arm.sh" zebrad-stack)
 (cd "$WORK/zebra-stack" && ZEBRA_EXTRA_FEATURES=pasta-asm \
   bash "$HARNESS/regtest/build-arm.sh" zebrad-crypto)
-(cd "$WORK/zebra-andale" && bash "$HARNESS/regtest/build-arm.sh" zebrad-andale)
 (cd "$WORK/zakura" && bash "$HARNESS/regtest/build-zakura.sh" zakurad-1.8.1)
 
 # Optional: set EXTRA_REVISION to the complete immutable Zebra commit first.
@@ -122,7 +118,7 @@ The wrappers execute these recipes under the environment above and write
 compiler version and environment:
 
 ```bash
-# stack, andale, optional extra
+# stack, optional extra
 cargo build --locked --release -p zebrad --features default-release-binaries,internal-miner
 # crypto
 cargo build --locked --release -p zebrad --features default-release-binaries,internal-miner,pasta-asm
@@ -143,8 +139,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(os.environ['HARNESS']) / 'regtest'))
 from v5_campaign import provenance
 bins = Path(os.environ['BENCH_BINS'])
-names = {'stack': 'zebrad-stack', 'crypto': 'zebrad-crypto',
-         'andale': 'zebrad-andale', 'zakura-main': 'zakurad-1.8.1'}
+names = {'stack': 'zebrad-stack', 'crypto': 'zebrad-crypto', 'zakura-main': 'zakurad-1.8.1'}
 if os.environ.get('EXTRA_REVISION'):
     names['extra'] = 'zebrad-extra'
 receipts = provenance({label: str(bins / name) for label, name in names.items()})
@@ -208,7 +203,6 @@ EOF
     >"$PREP/$label-copy.log" 2>&1
 }
 copy_prefix stack "$BENCH_BINS/zebrad-stack"
-copy_prefix andale "$BENCH_BINS/zebrad-andale"
 # crypto uses exactly stack's state format; create a separate stopped cache root.
 [[ ! -e $BENCH_MAINNET/crypto-3505700 ]]
 cp -a --reflink=always "$BENCH_MAINNET/stack-3505700" "$BENCH_MAINNET/crypto-3505700"
@@ -300,11 +294,9 @@ replay_args=(
   --provenance "$PROVENANCE"
   --arm "stack=$BENCH_BINS/zebrad-stack"
   --arm "crypto=$BENCH_BINS/zebrad-crypto"
-  --arm "andale=$BENCH_BINS/zebrad-andale"
   --arm "zakura-main=$BENCH_BINS/zakurad-1.8.1"
   --snapshot "stack=$BENCH_MAINNET/stack-3505700"
   --snapshot "crypto=$BENCH_MAINNET/crypto-3505700"
-  --snapshot "andale=$BENCH_MAINNET/andale-3505700"
   --snapshot "zakura-main=$BENCH_MAINNET/zakura-main-3505700"
   --corpus "$CORPUS" --cpus "$V5_CPUS"
 )
@@ -396,7 +388,7 @@ python3 -B regtest/sweep/build_fixtures.py \
 comparison() {
   bash "$HARNESS/regtest/v5-campaign.sh" --profile comparison --shared-host \
     --output "$BENCH_OUTPUT/regtest-comparison" "$@" \
-    stack:zebrad-stack crypto:zebrad-crypto andale:zebrad-andale \
+    stack:zebrad-stack crypto:zebrad-crypto \
     zakura-main:zakurad-1.8.1
 }
 comparison --dry-run
@@ -418,7 +410,7 @@ reserving the whole host, use this separate exclusive campaign:
 ```bash
 V5_CPUS=all bash regtest/v5-campaign.sh --profile comparison --exclusive \
   --output "$BENCH_OUTPUT/regtest-exclusive" \
-  stack:zebrad-stack crypto:zebrad-crypto andale:zebrad-andale \
+  stack:zebrad-stack crypto:zebrad-crypto \
   zakura-main:zakurad-1.8.1
 ```
 

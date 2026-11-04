@@ -188,7 +188,7 @@ class ReplayContracts(unittest.TestCase):
                 self.assertFalse(output.exists())
                 replay.main([*argv, '--exclusive'])
             affinity.assert_called_once_with(0, [8])
-            self.assertEqual(replay_run.call_count, 6)
+            self.assertEqual(replay_run.call_count, len(replay.SOURCES) + 2)
             manifest = json.loads((output / 'campaign.json').read_text())
             self.assertEqual(manifest['order'], [list(replay.SOURCES) + ['extra', 'sapling']])
             self.assertTrue(manifest['exclusive'])
