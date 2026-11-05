@@ -34,7 +34,8 @@ RUNS = Path(os.environ.get('BENCH_OUTPUT', ROOT / 'output')).expanduser().resolv
 SIGNED = Path(os.environ.get('BENCH_SIGNED_FIXTURES', ROOT / 'fixtures/transparent-signed')).expanduser().resolve()
 SOAK = Path(os.environ.get('BENCH_MAINNET', ROOT / 'mainnet')).expanduser().resolve()
 RELEASES = {'release': 'e8db87eb69254e0d4eedd058eadd48bdfa09065a',
-            'zakura-main': 'f5c20398c629c8179364b07f059da3c814af78ec'}
+            'zakura-main': os.environ.get('ZAKURA_MAIN_REVISION',
+                                          'f5c20398c629c8179364b07f059da3c814af78ec')}
 LABELS = ('release', 'stack', 'crypto', 'zakura-main')
 COMPARISON_REVISIONS = {
     'stack': '1c60fe3f00f6e5326411d786465ba540d191d709',
