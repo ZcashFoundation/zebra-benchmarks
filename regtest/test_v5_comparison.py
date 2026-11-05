@@ -21,7 +21,7 @@ class ComparisonTests(unittest.TestCase):
     def test_current_arms_and_interleaved_eighteen_run_rows(self):
         with patch.dict(os.environ, {}, clear=True):
             pieces = campaign.campaign_plan(self.arms, Path('/unused'), 'comparison')
-        self.assertEqual(list(pieces), ['smoke', 'peer-work-fresh', 'peer-work-settled', 'transparent-burst', 'served-submit'])
+        self.assertEqual(list(pieces), ['smoke', 'peer-work-fresh', 'peer-work-settled', 'transparent-burst', 'served-submit', 'sustained-churn'])
         labels = list(self.arms)
         for link, settle in (('fresh', '0'), ('settled', '20')):
             commands = pieces['peer-work-' + link][0]
@@ -122,7 +122,7 @@ class ComparisonTests(unittest.TestCase):
                     redirect_stdout(io.StringIO()) as printed:
                 campaign.main()
             commands = [line for line in printed.getvalue().splitlines() if not line.startswith('#')]
-            self.assertEqual(len(commands), 5)
+            self.assertEqual(len(commands), 6)
             self.assertTrue(all('--exclusive' in command and '--shared-host' not in command for command in commands))
 
     def test_comparison_rejects_wrong_source_even_for_stack(self):

@@ -440,6 +440,9 @@ def case(arm, binary, directory, fixture, chain, args, endpoint, *, restart_dela
         node.replay(chain)
         if endpoint in ("served-submitblock", "served-rebuild-submitblock"):
             return served_submit(node, fixture, args, rebuild=endpoint == "served-rebuild-submitblock")
+        if endpoint == "sustained-churn":
+            from sustained_churn import run
+            return run(node, fixture, args, template_changed)
         preparation_ns = None
         if endpoint in ("admission-to-template", "prepared-submitblock"):
             started = time.perf_counter_ns()
@@ -580,7 +583,10 @@ def main():
                         help="served endpoint delay after mining work, before submission (default 1; 0 and 0.05 supported)")
     parser.add_argument("--rebuild-observation-seconds", type=float, default=2.0,
                         help="served-rebuild-submitblock window for first replacement work before retaining A (default 2)")
-    parser.add_argument("--endpoints", nargs="+", choices=ENDPOINTS,
+    parser.add_argument("--churn-rate", type=float, default=20, help="steady signed admissions per second")
+    parser.add_argument("--churn-seconds", type=float, default=60, help="sustained admission window")
+    parser.add_argument("--churn-settle-seconds", type=float, default=20, help="untimed post-replay settling")
+    parser.add_argument("--endpoints", nargs="+", choices=(*ENDPOINTS, "sustained-churn"),
                         help="comparison endpoints to run; ablations keep their declared matrix")
     parser.add_argument(
         "--retry-failed",
@@ -599,6 +605,10 @@ def main():
         parser.error("--solve-delay-seconds must be finite and nonnegative")
     if not math.isfinite(args.rebuild_observation_seconds) or args.rebuild_observation_seconds <= 0:
         parser.error("--rebuild-observation-seconds must be finite and positive")
+    if (not math.isfinite(args.churn_rate) or args.churn_rate <= 0
+            or not math.isfinite(args.churn_seconds) or args.churn_seconds <= 0
+            or not math.isfinite(args.churn_settle_seconds) or args.churn_settle_seconds < 0):
+        parser.error("churn rate/duration must be finite and positive; settling finite and nonnegative")
     require(
         args.rounds >= 1
         and args.repetitions >= 1
@@ -781,6 +791,9 @@ def main():
            if any(endpoint.startswith("served-") for spec in specs for endpoint in spec["endpoints"]) else {}),
         **({"rebuild_observation_seconds": args.rebuild_observation_seconds}
            if any("served-rebuild-submitblock" in spec["endpoints"] for spec in specs) else {}),
+        **({"churn_rate": args.churn_rate, "churn_seconds": args.churn_seconds,
+            "churn_settle_seconds": args.churn_settle_seconds}
+           if any("sustained-churn" in spec["endpoints"] for spec in specs) else {}),
         host=dict(
             platform=platform.platform(),
             machine=platform.machine(),

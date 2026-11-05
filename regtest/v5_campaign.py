@@ -127,6 +127,14 @@ def plan(arms, output, profile='core'):
                        ('served', 'served-submitblock', 1),
                        ('rebuild-0ms', 'served-rebuild-submitblock', 0),
                        ('rebuild-50ms', 'served-rebuild-submitblock', 0.05))], 120)
+        name = 'sustained-churn'
+        add(name, [py('sweep/run_sweep.py', *arm_flags(arms), '--provenance', provenance,
+                      '--fixtures', SIGNED, '--fixtures-subset', 'transparent-signed-1900000',
+                      '--endpoints', 'sustained-churn', '--churn-rate', rate,
+                      '--churn-seconds', 60, '--churn-settle-seconds', 20, '--poll-ms', 100,
+                      '--rounds', 1, '--repetitions', 3, '--seed', 20261104, '--timeout', 1200,
+                      '--output', output / name / f'{rate}-tx-s')
+                   for rate in (20, 100)], 45)
         return pieces
 
     # Nine samples per cell, retaining the v3 three-round / three-repetition design.
@@ -337,6 +345,53 @@ def provenance(arms, profile='core'):
 
 def comparison_result(name, commands, arms):
     """Summarize only complete raw rows; never substitute full-work for first-work latency."""
+    if name == 'sustained-churn':
+        if len(commands) != 2:
+            raise ValueError('Incomplete sustained-churn commands')
+        cells = {}
+        for command, rate in zip(commands, (20, 100)):
+            if (command[command.index('--endpoints') + 1] != name
+                    or float(command[command.index('--churn-rate') + 1]) != rate
+                    or float(command[command.index('--churn-seconds') + 1]) != 60):
+                raise ValueError('Mismatched sustained-churn command')
+            directory = Path(command[command.index('--output') + 1])
+            rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
+            if len(rows) != 3 * len(arms) or any(
+                    row['status'] != 'ok' or row['arm'] not in arms
+                    or row['endpoint'] != name or row['fixture'] != 'transparent-signed-1900000'
+                    or row.get('churn_rate') != rate or row.get('churn_seconds') != 60
+                    or row.get('poll_interval_ms') != 100 for row in rows):
+                raise ValueError('Incomplete or mismatched comparison rows: sustained-churn')
+            result = dict(rate_tx_s=rate, duration_seconds=60, arms={},
+                          aggregation='median/min/max of three process statistics, not pooled RPC/transaction percentiles')
+            for arm in arms:
+                selected = sorted((row for row in rows if row['arm'] == arm),
+                                  key=lambda row: row['repetition'])
+                if len(selected) != 3 or {(row['round'], row['repetition']) for row in selected} != {(0, i) for i in range(3)}:
+                    raise ValueError('Missing or duplicate sustained-churn repetitions: ' + arm)
+                metrics = {}
+                for row in selected:
+                    values = {key: row[key] for key in (
+                        'actual_admitted_rate', 'admitted_during_window', 'admission_failures',
+                        'generator_missed_admissions', 'freshness_unobserved', 'template_rebuild_count',
+                        'template_builds_per_second', 'cpu_seconds', 'cpu_seconds_per_wall_second',
+                        'peak_rss_bytes')}
+                    for key, quantiles in (
+                            ('freshness_ns', ('median', 'p90', 'max')),
+                            ('gbt_latency_ns', ('median', 'p99')),
+                            ('cheap_rpc_latency_ns', ('median', 'p99')),
+                            ('admission_start_lag_ns', ('median', 'p99', 'max'))):
+                        values.update({key + '_' + q: row[key][q] for q in quantiles})
+                    for key, value in values.items():
+                        metrics.setdefault(key, []).append(value)
+                result['arms'][arm] = dict(samples=3, metrics={
+                    key: dict(values=values,
+                              median=statistics.median(values) if None not in values else None,
+                              min=min(values) if None not in values else None,
+                              max=max(values) if None not in values else None)
+                    for key, values in metrics.items()})
+            cells[f'{rate}-tx-s'] = result
+        return dict(piece=name, cells=cells)
     if name == 'served-submit':
         cells = (('served', 'served-submitblock', 1),
                  ('rebuild-0ms', 'served-rebuild-submitblock', 0),

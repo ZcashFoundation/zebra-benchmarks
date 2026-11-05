@@ -230,6 +230,50 @@ Regtest and Zakura v1.8.1 Regtest disable Equihash and hash-to-target verificati
 the nonce search still meets the served target, but this is not a production
 Equihash solver. A zero-length solution is not accepted.
 
+### Sustained mempool churn comparison
+
+The separate `comparison --piece sustained-churn` runs 20 and 100 tx/s as
+independent summary cells, each for 60 seconds after 20 seconds of settling,
+with one randomized/interleaved round and three fresh-process repetitions per
+arm. Supply the required `stack:zebrad-stack`, `crypto:zebrad-crypto` and
+`zakura-main:zakurad-1.8.1` arms (and any declared `extra-NAME` arms).
+The signed 1.9 MB fixture contains more than the stress cell's 6,000 transactions.
+Each run checks corpus size, unique inputs, absence of transaction dependencies,
+mempool cost and single-template capacity before admission; it never recycles inputs.
+Direct endpoint flags are `--churn-rate` (20), `--churn-seconds` (60) and
+`--churn-settle-seconds` (20). Churn polling is fixed at 100 ms.
+
+Admissions use 16 independent persistent RPC clients, paced against absolute
+deadlines rather than RPC completion. The queue is bounded to 32 outstanding
+requests; skipped slots, RPC failures, request-start lag and the actual
+acknowledged admissions per wall-second expose generator/server saturation.
+Responses finishing after the window are recorded but excluded from that rate.
+There are no measured `submitblock` or explicit proposal calls.
+
+Receipts and `sustained-churn/summary.json` retain:
+
+- Freshness median/p90/max: admission RPC response to first ordinary served GBT
+  response containing each txid (zero if inclusion preceded the acknowledgement).
+  Polling continues for up to `min(timeout, 60)` seconds after admissions finish;
+  this tail is excluded from cost metrics. Missing inclusions remain explicitly
+  censored via `freshness_unobserved`; percentiles describe observed inclusions.
+- Rebuild count/builds per second: observed longpoll-ID or work transitions
+  during the timed window, ignoring `curtime`-only changes. The initial template
+  is not a rebuild. This is a poll-resolution lower bound, not an internal build
+  counter: intermediate or byte-identical builds are unobservable.
+- GBT and concurrent `getblockcount` response latency median/p99 for polls
+  completed during churn, including HTTP/JSON costs. Raw timings retain sample
+  counts and expose missed polling slots; observers never replay missed slots.
+- Node CPU-seconds (`utime + stime` from `/proc/PID/stat`) divided by measured
+  window wall-seconds. Peak RSS is Linux `VmHWM` at the window endpoint, reset
+  with `/proc/PID/clear_refs=5` immediately before the window so replay is excluded.
+- Admission failures and generator misses, separately, including details.
+
+Summary cells report median/min/max of three **process-level statistics**, not
+pooled transaction/RPC percentiles; raw per-transaction observations remain in
+the sweep receipts. These cost metrics include the real node work induced by
+the two observers. No benchmark is launched by the planner's `--dry-run`.
+
 ### Headline results → commands
 
 Values below identify the published measurements, not expected assertions on another machine. Three-way values are optimized Zebra / Zebra v7.0.0 / Zakura.
