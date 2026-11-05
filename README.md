@@ -163,11 +163,21 @@ Core Regtest cells have five samples at 250 kB and 1.9 MB; RPC, inclusion and re
 
 The `comparison` profile keeps `submitblock-latency` unchanged: its cold and
 prepared cells time fixture-candidate submission, with an explicit proposal check
-only in the prepared cell. The separate `served-submit` piece runs
-`sweep/run_sweep.py --endpoints served-submitblock --solve-delay-seconds 1` against
-`$BENCH_SIGNED_FIXTURES/transparent-signed-1900000`. It uses the same declared
-arms/provenance, one round, three repetitions, seed `20261104` and 1,200-second
-timeout as `submitblock-latency`.
+only in the prepared cell. The separate `served-submit` piece runs three commands
+against `$BENCH_SIGNED_FIXTURES/transparent-signed-1900000`. Each uses the same
+declared arms/provenance, one round, three repetitions, seed `20261104` and
+1,200-second timeout as `submitblock-latency`:
+
+| Output under `served-submit/` | Endpoint | Solve delay | Rebuild observation |
+| --- | --- | --- | --- |
+| `served` | `served-submitblock` | 1 s | None |
+| `rebuild-0ms` | `served-rebuild-submitblock` | 0 s | 2 s |
+| `rebuild-50ms` | `served-rebuild-submitblock` | 0.05 s | 2 s |
+
+The piece's `summary.json` reads all three command outputs and reports separate
+`cells` with endpoint and `solve_delay_seconds` metadata. Each cell requires three
+successful samples per arm with matching delay metadata; the two rebuild delays
+are never pooled.
 
 ```bash
 bash "$HARNESS/regtest/v5-campaign.sh" --profile comparison \
@@ -175,20 +185,42 @@ bash "$HARNESS/regtest/v5-campaign.sh" --profile comparison \
   stack:zebrad-optimized crypto:zebrad-assembly zakura-main:zakurad-reference
 ```
 
-After transaction admission and exact template matching, this endpoint mines a
-block from the node's **served template bytes**, including its coinbase and
-transaction ordering, rather than reusing the fixture candidate. It issues no
-explicit proposal RPC. `run_sweep.py --solve-delay-seconds` defaults to `1` and
-accepts `0` for an immediate solve; invoke the sweep directly to configure that
-delay. Admission, template matching, the delay and mining are outside the timed
-`submitblock` request/reply. Receipts retain the served block's hash, SHA256 and
-byte size, `solve_delay_seconds`, `template_longpollid`, `pre_submit_longpollid`
-and `template_rebuilt_before_submit`. The latter compares the served template
-with a final non-longpoll `getblocktemplate` immediately before submission:
-changed longpoll IDs or work fields (version, parent, roots, time, bits, coinbase
-or ordered transaction bytes) count as an observed rebuild. Byte-identical
-internal rebuilds are not observable. These observations remain separate from
-submission latency. This is a controlled Regtest workload, not a measurement of
+The original endpoint admits the full corpus and waits for an exact template.
+That initial serving mostly warms all arms; it does **not** by itself isolate
+the serving-half cache benefit. The rebuilt case targets that benefit: admit
+`corpus[:-1]`, seed exact template **A**, then admit the last transaction. Poll
+ordinary `getblocktemplate` and take the **first RPC-visible replacement**, based
+on changed longpoll ID or work (including roots, coinbase and transaction order),
+ignoring a `curtime`-only roll. It does not require the replacement to contain
+the final transaction or wait for another exact full-corpus match. If no switch
+is observed within two seconds, keep A. The observation window is bounded by
+`min(timeout, rebuild_observation_seconds)`.
+The rebuild endpoint requires a nonempty corpus; default matrices omit it for
+coinbase-only fixtures.
+
+Both endpoints mine a block from the selected node's **served template bytes**,
+including its coinbase and transaction ordering, rather than reusing the fixture
+candidate. Neither issues an explicit proposal RPC. For direct sweep invocations,
+`--rebuild-observation-seconds` defaults to `2` and accepts finite positive values;
+`--solve-delay-seconds` defaults to `1` and accepts finite nonnegative values,
+including `0` and `0.05`. Admission, template matching/observation, delay and mining
+are outside the timed `submitblock` request/reply.
+
+Receipts retain the served block's hash, SHA256 and byte size,
+`solve_delay_seconds`, `template_ready_ns`, `template_longpollid`,
+`pre_submit_longpollid` and `template_rebuilt_before_submit`. Rebuild receipts also
+label `served_template_id` as `"A"` or `"rebuilt"` and record
+`final_admission_start_ns`, `final_admission_end_ns`,
+`template_switch_latency_ns` (from final admission completion; null if no switch)
+and `observation_elapsed_ns`. `template_ready_ns` marks selection of the template
+to mine. These monotonic-clock observations are separate from submission latency.
+
+`template_rebuilt_before_submit` compares the **selected** template with a final
+non-longpoll `getblocktemplate` immediately before submission: changed longpoll
+IDs or work fields (version, parent, roots, time, bits, coinbase or ordered
+transaction bytes) count as an observed further rebuild. This flag is distinct
+from the initial A-to-rebuilt selection; byte-identical internal rebuilds are not
+observable. This is a controlled Regtest workload, not a measurement of
 real-network solve-time distributions.
 
 Mining keeps the template's commitments and changes only the 32-byte nonce. It

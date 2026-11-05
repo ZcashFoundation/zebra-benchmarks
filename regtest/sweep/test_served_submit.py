@@ -127,20 +127,118 @@ class ServedSubmitTests(unittest.TestCase):
                                                                        latency_ns=1, reply=None)):
             self.assertTrue(run_sweep.served_submit(node, fixture, args)['template_rebuilt_before_submit'])
 
+    def test_rebuild_mines_first_replacement_or_original_A_after_window(self):
+        for delay, switches in ((0, True), (0.05, True), (1, False)):
+            with self.subTest(delay=delay, switches=switches):
+                rebuilt = work()
+                initial = dict(rebuilt, transactions=rebuilt["transactions"][:1], longpollid="A-id")
+                rolled_A = dict(initial, curtime=initial["curtime"] + 1)
+                first_rebuilt = dict(rebuilt, longpollid="rebuilt-id")
+                later_rebuilt = dict(rebuilt, longpollid="later-id", coinbasetxn=dict(data="cccc"))
+                corpus = [dict(txid="b", raw="bb", bytes=1), dict(txid="a", raw="aa", bytes=1)]
+                fixture = dict(parent=initial["previousblockhash"], corpus=corpus, raw="deadbeef")
+                state = dict(clock=0.0, pending=[], polls=0, mined=None)
+                events = []
+
+                def rpc(method, params=None):
+                    events.append((method, params))
+                    if method == "sendrawtransaction":
+                        txid = {"aa": "a", "bb": "b"}[params[0]]
+                        state["pending"].append(txid)
+                        return txid
+                    if method == "getblocktemplate":
+                        self.assertIsNone(params, "no proposal or longpoll RPC")
+                        self.assertEqual(state["pending"], ["b", "a"])
+                        state["polls"] += 1
+                        if state["polls"] == 1:
+                            return rolled_A
+                        if switches:
+                            return first_rebuilt if state["polls"] == 2 else later_rebuilt
+                        return initial
+                    if method == "submitblock":
+                        state["mined"] = params[0]
+                        return None
+                    if method == "getbestblockhash":
+                        return block_identity(state["mined"])["hash"]
+                    if method == "getblock":
+                        return state["mined"]
+                    raise AssertionError(method)
+
+                def exact(node, selected, parent, timeout, poll):
+                    self.assertEqual(selected, corpus[:-1])
+                    self.assertEqual(state["pending"], ["b"])
+                    return initial, 1
+
+                sleeps = []
+
+                def sleep(seconds):
+                    sleeps.append(seconds)
+                    state["clock"] += seconds
+
+                node = SimpleNamespace(rpc=SimpleNamespace(call=rpc), preload_receipt=lambda start: {})
+                args = SimpleNamespace(timeout=1 if switches else 0.015, poll_ms=10,
+                                       solve_delay_seconds=delay, rebuild_observation_seconds=0.02)
+                with patch.object(run_sweep, "exact_template", side_effect=exact), \
+                        patch.object(run_sweep.time, "monotonic", side_effect=lambda: state["clock"]), \
+                        patch.object(run_sweep.time, "sleep", side_effect=sleep):
+                    row = run_sweep.served_submit(node, fixture, args, rebuild=True)
+                chosen = first_rebuilt if switches else initial
+                self.assertEqual(state["mined"], h.regtest_block(chosen, solve=True))
+                self.assertEqual(row["served_template_id"], "rebuilt" if switches else "A")
+                self.assertEqual(row["template_longpollid"], chosen["longpollid"])
+                self.assertEqual(row["initial_template_longpollid"], "A-id")
+                self.assertEqual(row["served_template_contains_last_transaction"], switches)
+                self.assertEqual(row["template_rebuilt_before_submit"], switches)
+                self.assertEqual(row["rebuild_template_polls"], 2)
+                self.assertEqual(sleeps[-1], delay)
+                self.assertLessEqual(row["final_admission_start_ns"], row["final_admission_end_ns"])
+                self.assertLessEqual(row["final_admission_end_ns"], row["template_ready_ns"])
+                if switches:
+                    self.assertGreaterEqual(row["template_switch_latency_ns"], 0)
+                    self.assertEqual(row["template_switch_ns"], row["template_ready_ns"])
+                else:
+                    self.assertIsNone(row["template_switch_latency_ns"])
+                    self.assertIsNone(row["template_switch_ns"])
+                    self.assertEqual(row["rebuild_observation_seconds"], args.timeout)
+                self.assertEqual(events[:2], [("sendrawtransaction", ["bb"]), ("sendrawtransaction", ["aa"])])
+                self.assertEqual(events[2][0], "getblocktemplate")
+
+    def test_rebuild_requires_a_transaction_and_default_matrix_skips_empty(self):
+        with self.assertRaisesRegex(RuntimeError, "at least one fixture transaction"):
+            run_sweep.served_submit(None, dict(corpus=[]), SimpleNamespace(), rebuild=True)
+        from ablation import case_specs
+        specs = case_specs(["zebra-main"], [dict(id="empty", transaction_count=0),
+                                           dict(id="full", transaction_count=1)])
+        self.assertNotIn("served-rebuild-submitblock", specs[0]["endpoints"])
+        self.assertIn("served-rebuild-submitblock", specs[1]["endpoints"])
+
     def test_cli_delay_default_zero_and_invalid(self):
         arguments = ['run_sweep.py', '--arm', 'extra-ours=/missing/a', '--arm', 'zakura-main=/missing/b',
                      '--fixtures', '/missing/fixtures', '--output', '/missing/output',
-                     '--provenance', '/missing/provenance',
-                     '--endpoints', 'served-submitblock', '--dry-run']
-        for flags, expected in (([], 1), (['--solve-delay-seconds', '0'], 0)):
-            with patch('sys.argv', [*arguments, *flags]), patch('builtins.print') as output, \
-                    patch.object(run_sweep, 'load_fixtures') as fixtures:
-                run_sweep.main()
-                self.assertEqual(json.loads(output.call_args.args[0])['solve_delay_seconds'], expected)
-                fixtures.assert_not_called()
+                     '--provenance', '/missing/provenance', '--endpoints', 'served-submitblock']
+        original_parse = run_sweep.argparse.ArgumentParser.parse_args
+        parsed = []
+
+        def capture(parser):
+            options = original_parse(parser)
+            parsed.append(options)
+            return options
+
+        for flags, expected in (([], 1), (['--solve-delay-seconds', '0'], 0),
+                                (['--solve-delay-seconds', '0.05'], 0.05)):
+            with patch('sys.argv', [*arguments, *flags]), \
+                    patch.object(run_sweep.argparse.ArgumentParser, 'parse_args', capture), \
+                    patch.object(run_sweep, 'require', side_effect=StopIteration):
+                with self.assertRaises(StopIteration):
+                    run_sweep.main()
+            self.assertEqual(parsed[-1].solve_delay_seconds, expected)
         for invalid in ('-1', 'nan', 'inf'):
             with patch('sys.argv', [*arguments, '--solve-delay-seconds=' + invalid]), \
                     patch('sys.stderr'), self.assertRaises(SystemExit):
+                run_sweep.main()
+        for window in ("0", "-1", "nan", "inf"):
+            with patch("sys.argv", [*arguments, "--rebuild-observation-seconds=" + window]), \
+                    patch("sys.stderr"), self.assertRaises(SystemExit):
                 run_sweep.main()
 
 

@@ -296,31 +296,71 @@ def generation_case(arm, binary, directory, chain, args):
         )
 
 
-def served_submit(node, fixture, args):
-    """Mine the exact served work, without explicitly warming a proposal verdict."""
+def template_changed(original, latest, *, include_time=True):
+    """Compare RPC-visible work; ignore clock-only rolls when observing a rebuild."""
+    fields = ("version", "previousblockhash", "defaultroots", "bits")
+    return (
+        latest["longpollid"] != original["longpollid"]
+        or any(latest[key] != original[key] for key in fields)
+        or (include_time and latest["curtime"] != original["curtime"])
+        or latest["coinbasetxn"]["data"] != original["coinbasetxn"]["data"]
+        or [tx["data"] for tx in latest["transactions"]]
+        != [tx["data"] for tx in original["transactions"]]
+    )
+
+
+def served_submit(node, fixture, args, *, rebuild=False):
+    """Mine exact served work, optionally observing a same-tip rebuild first."""
     started = time.perf_counter_ns()
-    admit(node, fixture["corpus"])
-    template, polls = exact_template(node, fixture["corpus"], fixture["parent"],
+    corpus = fixture["corpus"]
+    require(not rebuild or corpus, "served rebuild requires at least one fixture transaction")
+    admit(node, corpus[:-1] if rebuild else corpus)
+    template, polls = exact_template(node, corpus[:-1] if rebuild else corpus, fixture["parent"],
                                      args.timeout, args.poll_ms / 1000)
     served_ns = time.perf_counter_ns()
+    rebuild_receipt = {}
+    if rebuild:
+        initial = template
+        admission_start = time.perf_counter_ns()
+        admit(node, corpus[-1:])
+        admission_end = time.perf_counter_ns()
+        window = min(args.rebuild_observation_seconds, args.timeout)
+        deadline = time.monotonic() + window
+        switch_ns, rebuild_polls = None, 0
+        while time.monotonic() < deadline:
+            observed = node.rpc.call("getblocktemplate")
+            observed_ns = time.perf_counter_ns()
+            rebuild_polls += 1
+            require(observed["previousblockhash"] == fixture["parent"], "rebuild changed parent")
+            if template_changed(initial, observed, include_time=False):
+                template, switch_ns = observed, observed_ns
+                break
+            time.sleep(min(args.poll_ms / 1000, max(0, deadline - time.monotonic())))
+        served_ns = switch_ns if switch_ns is not None else time.perf_counter_ns()
+        rebuild_receipt = dict(
+            initial_template_longpollid=initial["longpollid"],
+            served_template_id="rebuilt" if switch_ns is not None else "A",
+            final_admission_start_ns=admission_start, final_admission_end_ns=admission_end,
+            template_switch_ns=switch_ns,
+            template_switch_latency_ns=None if switch_ns is None else switch_ns - admission_end,
+            observation_elapsed_ns=served_ns - admission_end,
+            rebuild_observation_seconds=window, rebuild_template_polls=rebuild_polls,
+            served_template_contains_last_transaction=any(
+                tx["hash"] == corpus[-1]["txid"] for tx in template["transactions"]),
+            rebuild_switch_detection="first changed longpoll id or work excluding clock-only rolls; otherwise original A after observation window",
+        )
     raw = h.regtest_block(template, solve=True, timeout=args.timeout)
     candidate = dict(raw=raw, height=template["height"], **block_identity(raw))
     time.sleep(args.solve_delay_seconds)
     # Observe replacement without long-polling or switching away from our served work.
     latest = node.rpc.call("getblocktemplate")
     require(latest["previousblockhash"] == candidate["parent"], "served work parent is still active")
-    fields = ("version", "previousblockhash", "defaultroots", "curtime", "bits")
-    changed = (
-        latest["longpollid"] != template["longpollid"]
-        or any(latest[key] != template[key] for key in fields)
-        or latest["coinbasetxn"]["data"] != template["coinbasetxn"]["data"]
-        or [tx["data"] for tx in latest["transactions"]]
-        != [tx["data"] for tx in template["transactions"]]
-    )
+    changed = template_changed(template, latest)
     observation = timed_submit(node, candidate)
     accepted(node, candidate, observation.pop("reply"))
     observation.update(
         preparation_ns=observation["start_ns"] - started,
+        **rebuild_receipt,
         preparation="full admission, exact served work, Regtest nonce search and solve delay; no explicit proposal; excluded from submit timer",
         template_ready_ns=served_ns, template_polls=polls,
         admitted_transactions=len(fixture["corpus"]),
@@ -398,8 +438,8 @@ def case(arm, binary, directory, fixture, chain, args, endpoint, *, restart_dela
             return dict(observation, **preparation)
     with Node(binary, directory / "node", arm, args.timeout) as node:
         node.replay(chain)
-        if endpoint == "served-submitblock":
-            return served_submit(node, fixture, args)
+        if endpoint in ("served-submitblock", "served-rebuild-submitblock"):
+            return served_submit(node, fixture, args, rebuild=endpoint == "served-rebuild-submitblock")
         preparation_ns = None
         if endpoint in ("admission-to-template", "prepared-submitblock"):
             started = time.perf_counter_ns()
@@ -537,7 +577,9 @@ def main():
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--poll-ms", type=float, default=1.0)
     parser.add_argument("--solve-delay-seconds", type=float, default=1.0,
-                        help="served-submitblock delay after mining served work, before submission (default 1; 0 supported)")
+                        help="served endpoint delay after mining work, before submission (default 1; 0 and 0.05 supported)")
+    parser.add_argument("--rebuild-observation-seconds", type=float, default=2.0,
+                        help="served-rebuild-submitblock window for first replacement work before retaining A (default 2)")
     parser.add_argument("--endpoints", nargs="+", choices=ENDPOINTS,
                         help="comparison endpoints to run; ablations keep their declared matrix")
     parser.add_argument(
@@ -555,6 +597,8 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.solve_delay_seconds) or args.solve_delay_seconds < 0:
         parser.error("--solve-delay-seconds must be finite and nonnegative")
+    if not math.isfinite(args.rebuild_observation_seconds) or args.rebuild_observation_seconds <= 0:
+        parser.error("--rebuild-observation-seconds must be finite and positive")
     require(
         args.rounds >= 1
         and args.repetitions >= 1
@@ -734,7 +778,9 @@ def main():
         poll_interval_ms=args.poll_ms,
         timeout_seconds=args.timeout,
         **({"solve_delay_seconds": args.solve_delay_seconds}
-           if any("served-submitblock" in spec["endpoints"] for spec in specs) else {}),
+           if any(endpoint.startswith("served-") for spec in specs for endpoint in spec["endpoints"]) else {}),
+        **({"rebuild_observation_seconds": args.rebuild_observation_seconds}
+           if any("served-rebuild-submitblock" in spec["endpoints"] for spec in specs) else {}),
         host=dict(
             platform=platform.platform(),
             machine=platform.machine(),

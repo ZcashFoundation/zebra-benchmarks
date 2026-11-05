@@ -82,7 +82,10 @@ def declare_protocol(arms, fixtures, seed, confirm_seed, rounds, repetitions, mi
 
 def case_specs(arms, fixtures, protocol=None, stage=None):
     if stage != 2:
-        specs = [dict(fixture=fixture["id"], endpoints=list(ENDPOINTS), arms=list(arms)) for fixture in fixtures]
+        specs = [dict(fixture=fixture["id"],
+                      endpoints=[endpoint for endpoint in ENDPOINTS
+                                 if endpoint != "served-rebuild-submitblock" or fixture["transaction_count"] > 0],
+                      arms=list(arms)) for fixture in fixtures]
     else:
         specs = []
         for arm, primary in protocol["primaries"].items():

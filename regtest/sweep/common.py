@@ -14,7 +14,7 @@ import node_bench as h
 
 ARMS = ("zebra-main", "zebra-optimized", "zakura-main")
 ENDPOINTS = ("admission-to-template", "prepared-submitblock", "cold-submitblock", "submit-to-peer-tip",
-             "served-submitblock")
+             "served-submitblock", "served-rebuild-submitblock")
 # Direct-dispatch probes only: preserve the existing sweep/report matrix.
 PROBE_ENDPOINTS = ("cold-submitblock-nominer", "warm-mempool-submitblock")
 GENERATE_ENDPOINT = "generate-1-orchard-no-demand"

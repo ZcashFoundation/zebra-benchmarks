@@ -93,6 +93,8 @@ def analyze_rows(rows, manifest):
     results = []
     for endpoint in ENDPOINTS:
         for fixture in sorted(fixtures, key=lambda f: (f["filling"], f["bytes"])):
+            if (0, 0, next(iter(manifest["arms"])), fixture["id"], endpoint) not in indexed:
+                continue
             arrays = {arm: np.array([[indexed[(r, n, arm, fixture["id"], endpoint)]
                                      for n in range(repetitions)] for r in range(rounds)], dtype=float)
                       for arm in manifest["arms"]}

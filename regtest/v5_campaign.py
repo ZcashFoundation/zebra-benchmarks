@@ -11,8 +11,9 @@ record preload completion without removing that real startup cost.
 1.9 MB signed-transparent admission-to-template bursts per arm. Peer receivers
 are warm; first work may be coinbase-only. These controlled Regtest rows do not
 claim to reproduce the announcement's unspecified transaction/mempool setup.
-The separate served-submit piece mines exact served work without a proposal RPC,
-with a configurable solve delay (default 1 second, including zero).
+The separate served-submit piece mines initial served work after a one-second
+solve delay and first-observed rebuilt work after zero/50ms delays, without
+a proposal RPC; receipts retain admission and template-switch observations.
 Comparison defaults to CPUs 0-7,16-23; V5_CPUS=all (or empty) requires --exclusive
 after other host workloads have stopped. --shared-host never grants whole-host use.
 """
@@ -117,10 +118,15 @@ def plan(arms, output, profile='core'):
         name = 'served-submit'
         add(name, [py('sweep/run_sweep.py', *arm_flags(arms), '--provenance', provenance,
                       '--fixtures', SIGNED, '--fixtures-subset', 'transparent-signed-1900000',
-                      '--endpoints', 'served-submitblock', '--solve-delay-seconds', 1,
+                      '--endpoints', endpoint, '--solve-delay-seconds', delay,
+                      *(['--rebuild-observation-seconds', 2] if label != 'served' else []),
                       '--rounds', 1, '--repetitions', 3,
                       '--seed', 20261104, '--timeout', 1200,
-                      '--output', output / name)], 40)
+                      '--output', output / name / label)
+                   for label, endpoint, delay in (
+                       ('served', 'served-submitblock', 1),
+                       ('rebuild-0ms', 'served-rebuild-submitblock', 0),
+                       ('rebuild-50ms', 'served-rebuild-submitblock', 0.05))], 120)
         return pieces
 
     # Nine samples per cell, retaining the v3 three-round / three-repetition design.
@@ -331,6 +337,39 @@ def provenance(arms, profile='core'):
 
 def comparison_result(name, commands, arms):
     """Summarize only complete raw rows; never substitute full-work for first-work latency."""
+    if name == 'served-submit':
+        cells = (('served', 'served-submitblock', 1),
+                 ('rebuild-0ms', 'served-rebuild-submitblock', 0),
+                 ('rebuild-50ms', 'served-rebuild-submitblock', 0.05))
+        if len(commands) != len(cells):
+            raise ValueError('Incomplete served-submit commands')
+        results = {}
+        for command, (label, endpoint, delay) in zip(commands, cells):
+            if (command[command.index('--endpoints') + 1] != endpoint
+                    or float(command[command.index('--solve-delay-seconds') + 1]) != delay):
+                raise ValueError('Mismatched served-submit command: ' + label)
+            directory = Path(command[command.index('--output') + 1])
+            rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
+            if len(rows) != 3 * len(arms) or any(
+                    row['status'] != 'ok' or row['arm'] not in arms
+                    or row['endpoint'] != endpoint or row['fixture'] != 'transparent-signed-1900000'
+                    or row.get('solve_delay_seconds') != delay for row in rows):
+                raise ValueError('Incomplete or mismatched comparison rows: ' + name + '/' + label)
+            result = dict(piece=name, endpoint=endpoint, solve_delay_seconds=delay,
+                          metric='latency_ns', unit='s', fixture='transparent-signed-1900000',
+                          arms={}, timing='submitblock request to response for a block mined from the exact served template; '
+                          'no explicit proposal RPC; preparation, observation, solve delay and mining excluded')
+            for arm in arms:
+                selected = [row for row in rows if row['arm'] == arm]
+                if len(selected) != 3 or any(row['latency_ns'] <= 0 for row in selected):
+                    raise ValueError('Missing or invalid arm samples: ' + arm + '/' + label)
+                values = [row['latency_ns'] / 1e9 for row in selected]
+                result['arms'][arm] = dict(samples=3, median=statistics.median(values),
+                                          min=min(values), max=max(values),
+                                          block_bytes=sorted({row['block_bytes'] for row in selected}),
+                                          transaction_count=sorted({row['transaction_count'] for row in selected}))
+            results[label] = result
+        return dict(piece=name, cells=results)
     peer = name.startswith('peer-work-')
     if peer:
         rows = [json.loads((Path(command[-1]) / 'sample.json').read_text())
@@ -340,8 +379,7 @@ def comparison_result(name, commands, arms):
         rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
     count = 18 if peer else 3
     metric = 'first_template_latency_ns' if peer else 'latency_ns'
-    endpoint = ('served-submitblock' if name == 'served-submit' else
-                'submit-to-peer-template' if peer else 'admission-to-template')
+    endpoint = 'submit-to-peer-template' if peer else 'admission-to-template'
     if len(rows) != count * len(arms) or any(
             row['status'] != 'ok' or row['arm'] not in arms
             or row['endpoint'] != endpoint or row['fixture'] != 'transparent-signed-1900000'
@@ -350,10 +388,7 @@ def comparison_result(name, commands, arms):
     result = dict(piece=name, metric=metric, unit='ms' if peer else 's',
                   fixture='transparent-signed-1900000', arms={},
                   timing=('sender submitblock request to first receiver new-parent template response'
-                          if peer else 'submitblock request to response for exact served template work; no explicit proposal RPC'
-                          if name == 'served-submit' else 'start of serial transaction admission to exact full template, including matching'))
-    if name == 'served-submit':
-        result['endpoint'] = endpoint
+                          if peer else 'start of serial transaction admission to exact full template, including matching'))
     for arm in arms:
         selected = [row for row in rows if row['arm'] == arm]
         if len(selected) != count or any(row[metric] <= 0 for row in selected):
