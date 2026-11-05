@@ -162,6 +162,86 @@ The builder matures coinbases, funds independent transparent outputs and Orchard
 
 The recipe is deterministic for fixed inputs, but wallet keys, proofs, timestamps and outpoints vary between fresh generations. Deterministic signatures do not make the entire corpus byte-identical. Use `--resume-sealed-corpus` only when intentionally reusing already sealed inputs; it is unnecessary for a fresh directory. For the optional extended size sweep, generate `2000 25000 100000 250000 500000 1000000 1500000 1900000` instead.
 
+### Long signed setup chain (retention finalization)
+
+The existing `fixtures/zakura-1.8.1/signed` set stays unchanged. Build a separate
+set at height 1,100 above genesis to exceed this branch's 1,000-block
+non-finalized window. The builder adds only coinbase-only padding after funding,
+before signing the corpus; no large filler blocks or corpus spends are replayed.
+It then seals the usual empty, signed 250 kB and signed 1.9 MB candidates against
+the new parent. `--setup-blocks` is a minimum height, not an additional count;
+omitting it preserves the original funding-only recipe. Changing it cannot reuse
+an old funding checkpoint, even with `--resume-sealed-corpus`.
+
+Run these commands **on an otherwise idle machine**, not while a campaign is running.
+They use existing binaries and do not rebuild nodes:
+
+```bash
+export BENCH_BINS="$PWD/bins/zakura-1.8.1"
+export BENCH_FIXTURES="$PWD/fixtures/zakura-1.8.1/standard"
+export BENCH_SIGNED_FIXTURES="$PWD/fixtures/zakura-1.8.1/signed-long"
+export BENCH_OUTPUT="$PWD/out/zakura-1.8.1-long"
+mkdir -p "$BENCH_OUTPUT"
+python3 -B -m unittest discover -s regtest/sweep -p 'test_long_chain.py'
+python3 -B regtest/sweep/build_fixtures.py \
+  --producer "$BENCH_BINS/zebrad-stack" --transparent-signed \
+  --setup-blocks 1100 --sizes 2000 250000 1900000 --timeout 1200 \
+  --output "$BENCH_SIGNED_FIXTURES" >"$BENCH_OUTPUT/fixtures.log" 2>&1
+
+# Preserve the real build receipts; the extra-* label avoids a historical stack pin.
+python3 -B - <<'PY'
+import json, os
+from pathlib import Path
+bins, out = Path(os.environ["BENCH_BINS"]), Path(os.environ["BENCH_OUTPUT"])
+arms = {"extra-fixture-producer": "zebrad-stack", "zakura-main": "zakurad-1.8.1"}
+(out / "fixture-arms.json").write_text(json.dumps({
+    arm: json.loads((bins / (binary + ".build.json")).read_text())
+    for arm, binary in arms.items()
+}, indent=2) + "\n")
+PY
+# Each arm must replay all 1,100 blocks and accept every candidate at height 1,101.
+python3 -B regtest/sweep/run_sweep.py \
+  --arm "extra-fixture-producer=$BENCH_BINS/zebrad-stack" \
+  --arm "zakura-main=$BENCH_BINS/zakurad-1.8.1" \
+  --provenance "$BENCH_OUTPUT/fixture-arms.json" \
+  --fixtures "$BENCH_SIGNED_FIXTURES" \
+  --fixtures-subset empty transparent-signed-250000 transparent-signed-1900000 \
+  --endpoints cold-submitblock --rounds 1 --repetitions 1 --seed 20261105 \
+  --timeout 1200 --output "$BENCH_OUTPUT/fixture-acceptance"
+```
+
+Every setup replay goes through `node_bench.replay`: sequential `submitblock`
+calls and an exact best-parent check, before any measured sample. Each node
+directory retains `setup-replay.json` with block count, parent, `elapsed_ns` and
+seconds. This timer excludes process startup, template readiness and measured
+operations; receipt writing is also outside the timer. Producer replay receipts
+live under `signed-long/producers/`, acceptance receipts under the output above.
+Expected replay time is **unmeasured**: budget roughly 10–120 seconds per node
+as an inference for an idle SSD host, not a result; use the recorded receipts for
+actual Zebra/Zakura timings. Startup/key preload and candidate admission are
+additional. The padding remains small, but finalization adds database writes, so
+do not extrapolate total campaign ETA from the old chain.
+
+`v5_campaign.py` already forwards `BENCH_SIGNED_FIXTURES` to every signed
+comparison piece; `run_sweep.py` already takes `--fixtures`. No scheduler change
+is needed. Keep the override when running smoke and any later comparison piece,
+using a **fresh output directory**; do not mix short- and long-prefix receipts.
+For example (set `QUIET_DEVICE` for this host first):
+
+```bash
+bash regtest/v5-campaign.sh --profile comparison \
+  --output "$BENCH_OUTPUT/comparison" --piece smoke \
+  stack:zebrad-stack crypto:zebrad-crypto zakura-main:zakurad-1.8.1
+bash regtest/v5-campaign.sh --profile comparison \
+  --output "$BENCH_OUTPUT/comparison" --piece served-submit \
+  stack:zebrad-stack crypto:zebrad-crypto zakura-main:zakurad-1.8.1
+```
+
+Substitute any listed comparison piece and your actual comparison arms (the
+Sapling-fee generation piece still requires two Zebra arms and excludes Zakura).
+The standard empty smoke control continues to use `BENCH_FIXTURES`; all signed
+smoke and comparison workloads use the selected long set.
+
 ## Run the final campaign
 
 Define this shell function once; the result tables below use literal calls to it:

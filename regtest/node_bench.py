@@ -733,9 +733,17 @@ def scenario_gbtsapling(binary, out, args):
 
 
 def replay(node, chain):
+    started = time.perf_counter_ns()
     for entry in chain:
         require(node.rpc.call("submitblock", [entry["raw"]]) is None, "setup replay")
     require(node.rpc.call("getbestblockhash") == chain[-1]["hash"], "replayed parent")
+    elapsed = time.perf_counter_ns() - started
+    (node.dir / "setup-replay.json").write_text(json.dumps(dict(
+        blocks=len(chain), parent=chain[-1]["hash"],
+        elapsed_ns=elapsed,
+        seconds=elapsed / 1e9,
+        timing="submitblock replay through best-tip check; excludes process startup and template readiness",
+    ), indent=2) + "\n")
 
 
 def scenario_coldsubmit(binary, out, args):

@@ -277,6 +277,8 @@ def build_inputs(args):
         node_policy=NODE_POLICY,
         sources=sources(),
     )
+    if args.setup_blocks:
+        inputs["setup_blocks"] = args.setup_blocks
     if args.transparent_signed:
         import cryptography
         import transparent_signed
@@ -290,6 +292,8 @@ def checkpoint_changes(previous, current, allow_source_change):
             "sealed funding producer, size ladder or wallet image changed; cannot reuse corpus")
     require(previous.get("transparent_signed") == current.get("transparent_signed"),
             "signed filling/signing recipe changed; use a new output directory")
+    require(previous.get("setup_blocks", 0) == current.get("setup_blocks", 0),
+            "setup chain length changed; use a new output directory")
     changes = [key for key in sorted(set(previous) | set(current))
                if previous.get(key) != current.get(key)]
     require(not changes or allow_source_change,
@@ -418,6 +422,10 @@ def fund(args):
             "funding complete before corpus construction",
         )
 
+        # Extend with cheap coinbase-only blocks before creating any corpus spends.
+        # This crosses retention finalization without replaying large filler blocks.
+        wallet.mine(max(0, args.setup_blocks - wallet.rpc("getblockcount")))
+
         chain = []
         for height in range(1, wallet.rpc("getblockcount") + 1):
             block_hash = wallet.rpc("getblockhash", [height])
@@ -488,6 +496,7 @@ def build(args):
         checkpoint = fund(args)
     checkpoint_hash = file_hash(checkpoint_path)
     chain = json.loads((args.output / "chain.json").read_text())
+    require(len(chain) >= args.setup_blocks, "sealed setup chain meets requested minimum")
     corpus = json.loads((args.output / "corpus.json").read_text())
     fixtures, files = [], [
         "chain.json",
@@ -643,6 +652,8 @@ def build(args):
             sources=current_inputs["sources"],
             funding_sources=checkpoint["inputs"]["sources"],
             node_policy=NODE_POLICY,
+            setup_blocks=args.setup_blocks,
+            setup_height=len(chain),
             resume_input_changes=input_changes,
             producer=checkpoint["inputs"]["producer"],
             wallet_image=WALLET_IMAGE,
@@ -676,10 +687,14 @@ def main():
     parser.add_argument("--sizes", type=int, nargs="+")
     parser.add_argument("--transparent-signed", action="store_true",
                         help="build only signed P2PKH fillings plus empty, in a NEW fixture directory; defaults to 2000 250000 1900000")
+    parser.add_argument("--setup-blocks", type=int, default=0,
+                        help="minimum setup height above genesis; pad with coinbase-only blocks before corpus creation (default: funding chain only); use 1100 for retention finalization")
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--resume-sealed-corpus", action="store_true",
                         help="reuse sealed funding/blocks after source or producer-policy changes; immutable producer/image/size inputs must match")
     args = parser.parse_args()
+    if args.setup_blocks < 0:
+        parser.error("--setup-blocks must be nonnegative")
     args.sizes = args.sizes or ([2_000, 250_000, 1_900_000] if args.transparent_signed else list(SIZES))
     if args.transparent_signed:
         import transparent_signed
@@ -701,12 +716,14 @@ def main():
     )
     os.umask(0o077)
     if (args.output / "manifest.sha256").exists():
-        manifest, _, fixtures = load_fixtures(args.output)
+        manifest, chain, fixtures = load_fixtures(args.output)
         require(
             manifest["producer"]["sha256"] == file_hash(args.producer)
             and sorted({f["target_bytes"] for f in fixtures}) == args.sizes
-            and any(f["filling"] == "transparent-signed" for f in fixtures) == args.transparent_signed,
-            "completed fixture producer, size ladder or filling differs",
+            and any(f["filling"] == "transparent-signed" for f in fixtures) == args.transparent_signed
+            and manifest.get("setup_blocks", 0) == args.setup_blocks
+            and len(chain) >= args.setup_blocks,
+            "completed fixture producer, size ladder, filling or setup chain length differs",
         )
         print("Already complete and sealed:", args.output)
         return

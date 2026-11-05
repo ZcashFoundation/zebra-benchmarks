@@ -165,9 +165,9 @@ def nominer_check():
                 return []
             raise AssertionError(f"unexpected RPC, including templates/proposals: {method}")
 
-        with patch.object(run_sweep, "Node") as constructor:
+        with tempfile.TemporaryDirectory() as directory, patch.object(run_sweep, "Node") as constructor:
             constructor.return_value.__enter__.return_value = SimpleNamespace(
-                rpc=SimpleNamespace(call=rpc),
+                dir=Path(directory), rpc=SimpleNamespace(call=rpc),
                 preload_receipt=lambda start: dict(binary_preloads=True, preload_wait=True,
                                                    preload_done_relative_ns=-1))
             row = run_sweep.case("zebra-main", "/unused", Path("/unused"), fixture, chain, args, endpoint)
