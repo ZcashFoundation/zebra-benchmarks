@@ -84,9 +84,10 @@ def transaction(wallet, txid, kind):
 
 def validate_timing(row):
     require(row["latency_ns"] > 0, "strictly positive observation")
-    if row["endpoint"] == GENERATE_ENDPOINT:
+    if row["endpoint"] in (GENERATE_ENDPOINT, "generate-sapling-fee"):
         samples = row["generate_samples"]
-        require(len(samples) == GENERATE_BLOCKS, "exactly 20 measured generate calls per process")
+        expected = GENERATE_BLOCKS if row["endpoint"] == GENERATE_ENDPOINT else row["generate_blocks"]
+        require(len(samples) == expected and expected > 0, "declared measured generate calls per process")
         require(all(sample["latency_ns"] > 0
                     and sample["end_ns"] - sample["start_ns"] == sample["latency_ns"]
                     and sample["block_bytes"] > 0 for sample in samples),

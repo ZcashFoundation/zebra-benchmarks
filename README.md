@@ -62,6 +62,30 @@ Relative environment overrides resolve from the invoking directory; CLI paths ov
 
 Keep generated outputs outside version control. Generated receipts can contain local paths, system inventories and RPC configuration; review them before publishing. Use dedicated test-only wallets, keep RPC on loopback or a trusted isolated network, and never fund the signed fixture builder's deliberately public key on Mainnet.
 
+The comparison piece `generate-sapling-fee` requires at least two Zebra arms and
+excludes Zakura (Sapling coinbase payouts are unsupported). It replays the signed
+transparent funding prefix, admits the 250 kB and 1.9 MB fixture batches, and times
+20 individual `generate 1` calls per process, with three fresh processes per cell.
+Between calls it signs spends of the preceding block's fixture-key outputs and
+waits for exact mempool residency, outside the timer. Each block must contain the
+entire fee-paying batch and a Sapling-only coinbase. Receipts retain every call;
+comparisons use process medians, not pooled call samples. This runtime refill
+requires the signed fixture generator's `cryptography >=43` dependency.
+`generate` randomizes coinbase parameters and bypasses its clone's precomputed
+template/coinbase caches. A cold standalone `getblocktemplate` variant is not
+offered: RPC-enabled mining starts the updater and has no configuration bypass.
+For a focused two-arm run from `regtest/`:
+
+```bash
+python3 -B sweep/run_sweep.py \
+  --arm ours=/path/to/zebrad-ours --arm minus-11696=/path/to/zebrad-minus-11696 \
+  --provenance /path/to/arms.json --fixtures "$BENCH_SIGNED_FIXTURES" \
+  --fixtures-subset transparent-signed-250000 transparent-signed-1900000 \
+  --endpoints generate-sapling-fee --generate-blocks 20 \
+  --rounds 1 --repetitions 3 --seed 20261105 --timeout 1200 \
+  --output "$BENCH_OUTPUT/generate-sapling-fee"
+```
+
 ## Historical V5 build layout
 
 The Zebra pins below belong to the historical V5 campaign; the runnable Zakura recipe has been updated to v1.8.1. Running this combination creates new results, not a reproduction of the recorded v1.7.0 measurements. For the current three-arm stack/crypto/Zakura comparison, see the [v1.8.1 runbook](zakura-1.8.1-RUNBOOK.md): its Zebra stack is `1c60fe3f00` from the public `bench/zakura-1.8.1-stack` branch, with an explicit common compiler environment.

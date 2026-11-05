@@ -21,7 +21,7 @@ class ComparisonTests(unittest.TestCase):
     def test_current_arms_and_interleaved_eighteen_run_rows(self):
         with patch.dict(os.environ, {}, clear=True):
             pieces = campaign.campaign_plan(self.arms, Path('/unused'), 'comparison')
-        self.assertEqual(list(pieces), ['smoke', 'peer-work-fresh', 'peer-work-settled', 'transparent-burst', 'served-submit', 'sustained-churn'])
+        self.assertEqual(list(pieces), ['smoke', 'peer-work-fresh', 'peer-work-settled', 'transparent-burst', 'served-submit', 'sustained-churn', 'generate-sapling-fee'])
         labels = list(self.arms)
         for link, settle in (('fresh', '0'), ('settled', '20')):
             commands = pieces['peer-work-' + link][0]
@@ -87,6 +87,36 @@ class ComparisonTests(unittest.TestCase):
             self.assertNotIn('wait-quiet.sh', printed.getvalue())
             self.assertFalse(output.exists())
 
+    def test_generate_fee_piece_and_process_median_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            commands, _ = campaign.plan(self.arms, output, 'comparison')['generate-sapling-fee']
+            command, = commands
+            self.assertEqual(command[command.index('--fixtures-subset') + 1:command.index('--endpoints')],
+                             ['transparent-signed-250000', 'transparent-signed-1900000'])
+            self.assertEqual(command[command.index('--endpoints') + 1], 'generate-sapling-fee')
+            self.assertEqual(command[command.index('--generate-blocks') + 1], '20')
+            labels = [value.split('=')[0] for flag, value in zip(command, command[1:]) if flag == '--arm']
+            self.assertEqual(labels, ['stack', 'crypto'])
+            rows = [dict(status='ok', arm=arm, endpoint='generate-sapling-fee',
+                         fixture=f'transparent-signed-{size}', round=0, repetition=rep,
+                         generate_blocks=20, standalone_getblocktemplate_calls=0,
+                         latency_ns=(rep + 1) * 1_000_000_000,
+                         generate_samples=[dict(start_ns=1, end_ns=1 + (rep + 1) * 1_000_000_000,
+                                                latency_ns=(rep + 1) * 1_000_000_000,
+                                                block_bytes=size, fees_zat=10_000, transaction_count=2)] * 20)
+                    for arm in labels for size in (250000, 1900000) for rep in range(3)]
+            target = output / 'generate-sapling-fee'
+            target.mkdir()
+            path = target / 'observations.jsonl'
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            result = campaign.comparison_result('generate-sapling-fee', commands, self.arms)
+            self.assertEqual(result['cells']['transparent-signed-250000']['arms']['stack']['median'], 2)
+            rows[0]['generate_samples'][0]['fees_zat'] = 0
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            with self.assertRaisesRegex(ValueError, 'Invalid fee-paying'):
+                campaign.comparison_result('generate-sapling-fee', commands, self.arms)
+
     def test_dry_run_selects_served_submit_without_inspecting_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'not-created'
@@ -122,7 +152,7 @@ class ComparisonTests(unittest.TestCase):
                     redirect_stdout(io.StringIO()) as printed:
                 campaign.main()
             commands = [line for line in printed.getvalue().splitlines() if not line.startswith('#')]
-            self.assertEqual(len(commands), 6)
+            self.assertEqual(len(commands), 7)
             self.assertTrue(all('--exclusive' in command and '--shared-host' not in command for command in commands))
 
     def test_comparison_rejects_wrong_source_even_for_stack(self):

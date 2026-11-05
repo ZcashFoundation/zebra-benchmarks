@@ -135,6 +135,15 @@ def plan(arms, output, profile='core'):
                       '--rounds', 1, '--repetitions', 3, '--seed', 20261104, '--timeout', 1200,
                       '--output', output / name / f'{rate}-tx-s')
                    for rate in (20, 100)], 45)
+        if len(zebra) >= 2:
+            name = 'generate-sapling-fee'
+            add(name, [py('sweep/run_sweep.py', *arm_flags(zebra), '--provenance', provenance,
+                          '--fixtures', SIGNED, '--fixtures-subset',
+                          'transparent-signed-250000', 'transparent-signed-1900000',
+                          '--endpoints', name, '--generate-blocks', 20,
+                          '--rounds', 1, '--repetitions', 3,
+                          '--seed', 20261105, '--timeout', 1200,
+                          '--output', output / name)], 90)
         return pieces
 
     # Nine samples per cell, retaining the v3 three-round / three-repetition design.
@@ -345,6 +354,40 @@ def provenance(arms, profile='core'):
 
 def comparison_result(name, commands, arms):
     """Summarize only complete raw rows; never substitute full-work for first-work latency."""
+    if name == 'generate-sapling-fee':
+        zebra = {arm: binary for arm, binary in arms.items() if arm != 'zakura-main'}
+        command, = commands
+        directory = Path(command[command.index('--output') + 1])
+        rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
+        fixtures = ('transparent-signed-250000', 'transparent-signed-1900000')
+        if len(rows) != 6 * len(zebra) or any(
+                row['status'] != 'ok' or row['arm'] not in zebra or row['endpoint'] != name
+                or row['fixture'] not in fixtures or row.get('generate_blocks') != 20
+                or len(row.get('generate_samples', [])) != 20
+                or row.get('standalone_getblocktemplate_calls') != 0 for row in rows):
+            raise ValueError('Incomplete or mismatched comparison rows: ' + name)
+        cells = {}
+        for fixture in fixtures:
+            result = dict(endpoint=name, fixture=fixture, unit='s', arms={},
+                          timing='median of 20 generate-1 RPC latencies per process; signed refill/admission excluded')
+            for arm in zebra:
+                selected = [row for row in rows if row['fixture'] == fixture and row['arm'] == arm]
+                if (len(selected) != 3
+                        or {(row['round'], row['repetition']) for row in selected} != {(0, i) for i in range(3)}
+                        or any(row['latency_ns'] <= 0
+                               or row['latency_ns'] != statistics.median(sample['latency_ns'] for sample in row['generate_samples'])
+                               or any(sample['fees_zat'] <= 0 or sample['transaction_count'] <= 1
+                                      or sample['end_ns'] - sample['start_ns'] != sample['latency_ns']
+                                      or sample['latency_ns'] <= 0 for sample in row['generate_samples'])
+                               for row in selected)):
+                    raise ValueError('Invalid fee-paying generation samples: ' + arm + '/' + fixture)
+                values = [row['latency_ns'] / 1e9 for row in selected]
+                result['arms'][arm] = dict(samples=3, calls_per_process=20,
+                                          median=statistics.median(values), min=min(values), max=max(values),
+                                          block_bytes=sorted({sample['block_bytes'] for row in selected
+                                                              for sample in row['generate_samples']}))
+            cells[fixture] = result
+        return dict(piece=name, cells=cells)
     if name == 'sustained-churn':
         if len(commands) != 2:
             raise ValueError('Incomplete sustained-churn commands')

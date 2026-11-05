@@ -52,6 +52,7 @@ from ablation import (
     generated_fixture,
     stage1_reference,
 )
+from generate_sapling_fee import ENDPOINT as SAPLING_FEE_ENDPOINT, run as generate_sapling_fee
 
 
 # Keep in sync with zebra-chain/src/parameters/constants.rs.
@@ -385,6 +386,10 @@ def case(arm, binary, directory, fixture, chain, args, endpoint, *, restart_dela
                 "restart requires a cold or finalization endpoint")
     if endpoint == GENERATE_ENDPOINT:
         return generation_case(arm, binary, directory, chain, args)
+    if endpoint == SAPLING_FEE_ENDPOINT:
+        require(arm != "zakura-main", "Zakura does not support Sapling coinbase payouts")
+        with Node(binary, directory / "node", arm, args.timeout, miner=h.SAPLING_MINER) as node:
+            return generate_sapling_fee(node, fixture, chain, args)
     if endpoint == "submit-to-peer-tip":
         with Node(binary, directory / "sender", arm, args.timeout) as sender, Node(
             binary, directory / "peer", arm, args.timeout
@@ -569,6 +574,8 @@ def main():
         default=ORCHARD_MINER,
         help="Orchard-only Regtest UA for the 20-block generate primary",
     )
+    parser.add_argument("--generate-blocks", type=int, default=GENERATE_BLOCKS,
+                        help="individually timed calls per generate-sapling-fee process")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--repetitions", type=int, default=3)
@@ -586,7 +593,7 @@ def main():
     parser.add_argument("--churn-rate", type=float, default=20, help="steady signed admissions per second")
     parser.add_argument("--churn-seconds", type=float, default=60, help="sustained admission window")
     parser.add_argument("--churn-settle-seconds", type=float, default=20, help="untimed post-replay settling")
-    parser.add_argument("--endpoints", nargs="+", choices=(*ENDPOINTS, "sustained-churn"),
+    parser.add_argument("--endpoints", nargs="+", choices=(*ENDPOINTS, "sustained-churn", SAPLING_FEE_ENDPOINT),
                         help="comparison endpoints to run; ablations keep their declared matrix")
     parser.add_argument(
         "--retry-failed",
@@ -612,6 +619,7 @@ def main():
     require(
         args.rounds >= 1
         and args.repetitions >= 1
+        and args.generate_blocks >= 1
         and args.timeout > 0
         and 0.1 <= args.poll_ms <= 100
         and (args.through_round is None or 1 <= args.through_round <= args.rounds),
@@ -794,6 +802,9 @@ def main():
         **({"churn_rate": args.churn_rate, "churn_seconds": args.churn_seconds,
             "churn_settle_seconds": args.churn_settle_seconds}
            if any("sustained-churn" in spec["endpoints"] for spec in specs) else {}),
+        **({"sapling_fee_generate_blocks": args.generate_blocks,
+            "sapling_fee_miner": h.SAPLING_MINER}
+           if any(SAPLING_FEE_ENDPOINT in spec["endpoints"] for spec in specs) else {}),
         host=dict(
             platform=platform.platform(),
             machine=platform.machine(),
@@ -801,7 +812,7 @@ def main():
         ),
         clock=vars(time.get_clock_info("perf_counter")),
         notes=[
-            "Admission/prepared/cold/relay use sealed fixture bytes. Served submission uses fixture admission but mines that node's exact served work; served_block_* identifies its actual bytes. Generation uses the same sealed prefix and Orchard-only miner but real randomized proof/block bytes.",
+            "Admission/prepared/cold/relay use sealed fixture bytes. Served submission mines exact served work. Generation uses randomized proof/block bytes: Orchard-only without fees, or Sapling-only with signed fee batches refilled outside each generate timer.",
             "Every fixture/repetition/endpoint uses fresh processes and fresh state; prepared setup repeats admission without replacing its separate measurement.",
             "Cold means candidate transactions were never admitted or proposal-checked; funding replay still warms code/state. OS page caches are not flushed.",
             "Prepared is a protocol, not evidence that any implementation-specific production-PoW cache gate was reached on Regtest.",
