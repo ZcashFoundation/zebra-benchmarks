@@ -11,6 +11,8 @@ record preload completion without removing that real startup cost.
 1.9 MB signed-transparent admission-to-template bursts per arm. Peer receivers
 are warm; first work may be coinbase-only. These controlled Regtest rows do not
 claim to reproduce the announcement's unspecified transaction/mempool setup.
+The separate served-submit piece mines exact served work without a proposal RPC,
+with a configurable solve delay (default 1 second, including zero).
 Comparison defaults to CPUs 0-7,16-23; V5_CPUS=all (or empty) requires --exclusive
 after other host workloads have stopped. --shared-host never grants whole-host use.
 """
@@ -112,6 +114,13 @@ def plan(arms, output, profile='core'):
                       '--endpoints', 'admission-to-template', '--rounds', 1, '--repetitions', 3,
                       '--seed', 20261104, '--poll-ms', 1, '--timeout', 1200,
                       '--output', output / name)], 35)
+        name = 'served-submit'
+        add(name, [py('sweep/run_sweep.py', *arm_flags(arms), '--provenance', provenance,
+                      '--fixtures', SIGNED, '--fixtures-subset', 'transparent-signed-1900000',
+                      '--endpoints', 'served-submitblock', '--solve-delay-seconds', 1,
+                      '--rounds', 1, '--repetitions', 3,
+                      '--seed', 20261104, '--timeout', 1200,
+                      '--output', output / name)], 40)
         return pieces
 
     # Nine samples per cell, retaining the v3 three-round / three-repetition design.
@@ -331,7 +340,8 @@ def comparison_result(name, commands, arms):
         rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
     count = 18 if peer else 3
     metric = 'first_template_latency_ns' if peer else 'latency_ns'
-    endpoint = 'submit-to-peer-template' if peer else 'admission-to-template'
+    endpoint = ('served-submitblock' if name == 'served-submit' else
+                'submit-to-peer-template' if peer else 'admission-to-template')
     if len(rows) != count * len(arms) or any(
             row['status'] != 'ok' or row['arm'] not in arms
             or row['endpoint'] != endpoint or row['fixture'] != 'transparent-signed-1900000'
@@ -340,7 +350,10 @@ def comparison_result(name, commands, arms):
     result = dict(piece=name, metric=metric, unit='ms' if peer else 's',
                   fixture='transparent-signed-1900000', arms={},
                   timing=('sender submitblock request to first receiver new-parent template response'
-                          if peer else 'start of serial transaction admission to exact full template, including matching'))
+                          if peer else 'submitblock request to response for exact served template work; no explicit proposal RPC'
+                          if name == 'served-submit' else 'start of serial transaction admission to exact full template, including matching'))
+    if name == 'served-submit':
+        result['endpoint'] = endpoint
     for arm in arms:
         selected = [row for row in rows if row['arm'] == arm]
         if len(selected) != count or any(row[metric] <= 0 for row in selected):

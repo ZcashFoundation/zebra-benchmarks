@@ -21,7 +21,7 @@ class ComparisonTests(unittest.TestCase):
     def test_current_arms_and_interleaved_eighteen_run_rows(self):
         with patch.dict(os.environ, {}, clear=True):
             pieces = campaign.campaign_plan(self.arms, Path('/unused'), 'comparison')
-        self.assertEqual(list(pieces), ['smoke', 'peer-work-fresh', 'peer-work-settled', 'transparent-burst'])
+        self.assertEqual(list(pieces), ['smoke', 'peer-work-fresh', 'peer-work-settled', 'transparent-burst', 'served-submit'])
         labels = list(self.arms)
         for link, settle in (('fresh', '0'), ('settled', '20')):
             commands = pieces['peer-work-' + link][0]
@@ -41,6 +41,18 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(burst[burst.index('--fixtures-subset') + 1], 'transparent-signed-1900000')
         self.assertEqual(burst[burst.index('--rounds') + 1], '1')
         self.assertEqual(burst[burst.index('--repetitions') + 1], '3')
+        served = pieces['served-submit'][0][0]
+        self.assertEqual(served[served.index('--endpoints') + 1:served.index('--solve-delay-seconds')],
+                         ['served-submitblock'])
+        self.assertEqual(served[served.index('--solve-delay-seconds') + 1], '1')
+        self.assertIn('sweep/run_sweep.py', served)
+        for flag in ('--fixtures', '--fixtures-subset', '--rounds', '--repetitions',
+                     '--provenance', '--seed', '--timeout'):
+            self.assertEqual(served[served.index(flag) + 1], burst[burst.index(flag) + 1])
+        self.assertEqual(served[served.index('--fixtures') + 1], str(campaign.SIGNED))
+        self.assertEqual(served[served.index('--output') + 1], '/unused/served-submit')
+        self.assertEqual([value for flag, value in zip(served, served[1:]) if flag == '--arm'],
+                         [f'{arm}={binary}' for arm, binary in self.arms.items()])
         with patch.dict(os.environ, {'V5_CPUS': 'all'}):
             whole_host = campaign.campaign_plan(self.arms, Path('/unused'), 'comparison')
         self.assertTrue(all('taskset' not in command for commands, _ in whole_host.values() for command in commands))
@@ -66,6 +78,23 @@ class ComparisonTests(unittest.TestCase):
             self.assertNotIn('wait-quiet.sh', printed.getvalue())
             self.assertFalse(output.exists())
 
+    def test_dry_run_selects_served_submit_without_inspecting_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'not-created'
+            argv = ['v5_campaign.py', '--profile', 'comparison', '--piece', 'served-submit',
+                    '--dry-run', '--output', str(output), *self.specs]
+            with patch('sys.argv', argv), redirect_stdout(io.StringIO()) as printed, \
+                    patch.object(campaign.subprocess, 'run', side_effect=AssertionError('launched command')), \
+                    patch.object(campaign, 'provenance', side_effect=AssertionError('inspected binaries')), \
+                    patch.dict(os.environ, {'V5_CPUS': '0-7,16-23'}):
+                campaign.main()
+            text = printed.getvalue()
+            self.assertIn('# served-submit:', text)
+            self.assertIn('--endpoints served-submitblock --solve-delay-seconds 1', text)
+            self.assertNotIn('# submitblock-latency:', text)
+            self.assertEqual(text.count('sweep/run_sweep.py'), 1)
+            self.assertFalse(output.exists())
+
     def test_whole_host_requires_exclusive_acknowledgement(self):
         argv = ['v5_campaign.py', '--profile', 'comparison', '--steps', *self.specs]
         for cpus in ('', 'all'):
@@ -78,7 +107,7 @@ class ComparisonTests(unittest.TestCase):
                     redirect_stdout(io.StringIO()) as printed:
                 campaign.main()
             commands = [line for line in printed.getvalue().splitlines() if not line.startswith('#')]
-            self.assertEqual(len(commands), 4)
+            self.assertEqual(len(commands), 5)
             self.assertTrue(all('--exclusive' in command and '--shared-host' not in command for command in commands))
 
     def test_comparison_rejects_wrong_source_even_for_stack(self):
@@ -100,7 +129,7 @@ class ComparisonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pieces = campaign.campaign_plan(self.arms, root, 'comparison')
-            for name in ('peer-work-fresh', 'transparent-burst'):
+            for name in ('peer-work-fresh', 'transparent-burst', 'served-submit'):
                 commands = pieces[name][0]
                 peer = name.startswith('peer-work-')
                 count, unit = (18, 'ms') if peer else (3, 's')
@@ -109,7 +138,9 @@ class ComparisonTests(unittest.TestCase):
                 for repetition in range(count):
                     for arm, _ in campaign.rotate(self.arms, repetition):
                         rows.append(dict(status='ok', arm=arm,
-                                         endpoint='submit-to-peer-template' if peer else 'admission-to-template',
+                                         endpoint={'peer-work-fresh': 'submit-to-peer-template',
+                                                   'transparent-burst': 'admission-to-template',
+                                                   'served-submit': 'served-submitblock'}[name],
                                          fixture='transparent-signed-1900000', block_bytes=1899900,
                                          transaction_count=5001,
                                          latency_ns=(1000 if peer else repetition + 1) * scale,
@@ -125,6 +156,10 @@ class ComparisonTests(unittest.TestCase):
                     path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
                 result = campaign.comparison_result(name, commands, self.arms)
                 self.assertEqual(result['unit'], unit)
+                if name == 'served-submit':
+                    self.assertEqual(result['endpoint'], 'served-submitblock')
+                    self.assertIn('exact served template', result['timing'])
+                    self.assertIn('no explicit proposal RPC', result['timing'])
                 for arm in self.arms:
                     self.assertEqual(result['arms'][arm], dict(samples=count, median=(count + 1) / 2,
                                      min=1, max=count, block_bytes=[1899900], transaction_count=[5001]))

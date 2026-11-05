@@ -4,6 +4,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -295,6 +296,48 @@ def generation_case(arm, binary, directory, chain, args):
         )
 
 
+def served_submit(node, fixture, args):
+    """Mine the exact served work, without explicitly warming a proposal verdict."""
+    started = time.perf_counter_ns()
+    admit(node, fixture["corpus"])
+    template, polls = exact_template(node, fixture["corpus"], fixture["parent"],
+                                     args.timeout, args.poll_ms / 1000)
+    served_ns = time.perf_counter_ns()
+    raw = h.regtest_block(template, solve=True, timeout=args.timeout)
+    candidate = dict(raw=raw, height=template["height"], **block_identity(raw))
+    time.sleep(args.solve_delay_seconds)
+    # Observe replacement without long-polling or switching away from our served work.
+    latest = node.rpc.call("getblocktemplate")
+    require(latest["previousblockhash"] == candidate["parent"], "served work parent is still active")
+    fields = ("version", "previousblockhash", "defaultroots", "curtime", "bits")
+    changed = (
+        latest["longpollid"] != template["longpollid"]
+        or any(latest[key] != template[key] for key in fields)
+        or latest["coinbasetxn"]["data"] != template["coinbasetxn"]["data"]
+        or [tx["data"] for tx in latest["transactions"]]
+        != [tx["data"] for tx in template["transactions"]]
+    )
+    observation = timed_submit(node, candidate)
+    accepted(node, candidate, observation.pop("reply"))
+    observation.update(
+        preparation_ns=observation["start_ns"] - started,
+        preparation="full admission, exact served work, Regtest nonce search and solve delay; no explicit proposal; excluded from submit timer",
+        template_ready_ns=served_ns, template_polls=polls,
+        admitted_transactions=len(fixture["corpus"]),
+        template_transactions=len(template["transactions"]),
+        template_longpollid=template["longpollid"], pre_submit_longpollid=latest["longpollid"],
+        template_rebuilt_before_submit=changed,
+        template_rebuild_detection="longpoll id or serialized work changed at pre-submit poll; byte-identical internal rebuilds are not observable",
+        solve_delay_seconds=args.solve_delay_seconds,
+        solve_elapsed_ns=observation["start_ns"] - served_ns,
+        pow_solution="regtest-zero-equihash-36",
+        pow_nonce=int.from_bytes(bytes.fromhex(raw)[108:140], "little"),
+        served_block_hash=candidate["hash"], served_block_sha256=candidate["sha256"],
+        served_block_bytes=candidate["bytes"],
+    )
+    return observation
+
+
 def case(arm, binary, directory, fixture, chain, args, endpoint, *, restart_delay_seconds=None,
          prefix_state=None, prelude=None):
     if restart_delay_seconds is not None:
@@ -355,6 +398,8 @@ def case(arm, binary, directory, fixture, chain, args, endpoint, *, restart_dela
             return dict(observation, **preparation)
     with Node(binary, directory / "node", arm, args.timeout) as node:
         node.replay(chain)
+        if endpoint == "served-submitblock":
+            return served_submit(node, fixture, args)
         preparation_ns = None
         if endpoint in ("admission-to-template", "prepared-submitblock"):
             started = time.perf_counter_ns()
@@ -491,6 +536,8 @@ def main():
     )
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--poll-ms", type=float, default=1.0)
+    parser.add_argument("--solve-delay-seconds", type=float, default=1.0,
+                        help="served-submitblock delay after mining served work, before submission (default 1; 0 supported)")
     parser.add_argument("--endpoints", nargs="+", choices=ENDPOINTS,
                         help="comparison endpoints to run; ablations keep their declared matrix")
     parser.add_argument(
@@ -506,6 +553,8 @@ def main():
         "succeeding only if all their endpoints have ok receipts",
     )
     args = parser.parse_args()
+    if not math.isfinite(args.solve_delay_seconds) or args.solve_delay_seconds < 0:
+        parser.error("--solve-delay-seconds must be finite and nonnegative")
     require(
         args.rounds >= 1
         and args.repetitions >= 1
@@ -684,6 +733,8 @@ def main():
         ),
         poll_interval_ms=args.poll_ms,
         timeout_seconds=args.timeout,
+        **({"solve_delay_seconds": args.solve_delay_seconds}
+           if any("served-submitblock" in spec["endpoints"] for spec in specs) else {}),
         host=dict(
             platform=platform.platform(),
             machine=platform.machine(),
@@ -691,7 +742,7 @@ def main():
         ),
         clock=vars(time.get_clock_info("perf_counter")),
         notes=[
-            "Admission/submit/relay use identical sealed block bytes; generation uses the same sealed prefix and Orchard-only miner but real randomized proof/block bytes.",
+            "Admission/prepared/cold/relay use sealed fixture bytes. Served submission uses fixture admission but mines that node's exact served work; served_block_* identifies its actual bytes. Generation uses the same sealed prefix and Orchard-only miner but real randomized proof/block bytes.",
             "Every fixture/repetition/endpoint uses fresh processes and fresh state; prepared setup repeats admission without replacing its separate measurement.",
             "Cold means candidate transactions were never admitted or proposal-checked; funding replay still warms code/state. OS page caches are not flushed.",
             "Prepared is a protocol, not evidence that any implementation-specific production-PoW cache gate was reached on Regtest.",

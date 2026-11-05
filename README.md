@@ -159,6 +159,45 @@ A complete run includes Mainnet snapshot workloads, so prepare those inputs firs
 
 Core Regtest cells have five samples at 250 kB and 1.9 MB; RPC, inclusion and replay have three repetitions, startup five. Short post-ready tests wait for supported key preload. Startup and sync deliberately include startup costs. “Cold” means no candidate mempool/proposal verdict, not cold filesystem caches. Direct relay's fresh-connection panel is the historical pre-NODELAY experiment.
 
+### Served-template submission comparison
+
+The `comparison` profile keeps `submitblock-latency` unchanged: its cold and
+prepared cells time fixture-candidate submission, with an explicit proposal check
+only in the prepared cell. The separate `served-submit` piece runs
+`sweep/run_sweep.py --endpoints served-submitblock --solve-delay-seconds 1` against
+`$BENCH_SIGNED_FIXTURES/transparent-signed-1900000`. It uses the same declared
+arms/provenance, one round, three repetitions, seed `20261104` and 1,200-second
+timeout as `submitblock-latency`.
+
+```bash
+bash "$HARNESS/regtest/v5-campaign.sh" --profile comparison \
+  --piece served-submit --dry-run --output "$BENCH_OUTPUT/v5-comparison" \
+  stack:zebrad-optimized crypto:zebrad-assembly zakura-main:zakurad-reference
+```
+
+After transaction admission and exact template matching, this endpoint mines a
+block from the node's **served template bytes**, including its coinbase and
+transaction ordering, rather than reusing the fixture candidate. It issues no
+explicit proposal RPC. `run_sweep.py --solve-delay-seconds` defaults to `1` and
+accepts `0` for an immediate solve; invoke the sweep directly to configure that
+delay. Admission, template matching, the delay and mining are outside the timed
+`submitblock` request/reply. Receipts retain the served block's hash, SHA256 and
+byte size, `solve_delay_seconds`, `template_longpollid`, `pre_submit_longpollid`
+and `template_rebuilt_before_submit`. The latter compares the served template
+with a final non-longpoll `getblocktemplate` immediately before submission:
+changed longpoll IDs or work fields (version, parent, roots, time, bits, coinbase
+or ordered transaction bytes) count as an observed rebuild. Byte-identical
+internal rebuilds are not observable. These observations remain separate from
+submission latency. This is a controlled Regtest workload, not a measurement of
+real-network solve-time distributions.
+
+Mining keeps the template's commitments and changes only the 32-byte nonce. It
+uses a CompactSize-prefixed 36-byte zero Equihash solution and searches SHA256d
+header hashes against the target encoded by the served `bits`. Both Zebra
+Regtest and Zakura v1.8.1 Regtest disable Equihash and hash-to-target verification;
+the nonce search still meets the served target, but this is not a production
+Equihash solver. A zero-length solution is not accepted.
+
 ### Headline results → commands
 
 Values below identify the published measurements, not expected assertions on another machine. Three-way values are optimized Zebra / Zebra v7.0.0 / Zakura.
