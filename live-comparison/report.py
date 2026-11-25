@@ -11,6 +11,7 @@ import random
 import shutil
 import statistics
 
+from latency_stats import summary
 from workload import COMPONENTS, ParseError, THRESHOLDS, parse_block
 
 WINDOW_MS = 300_000
@@ -139,7 +140,8 @@ def prepare(records):
                            tx_count=None, observed_parent_gap_ms=None, parse_status="error",
                            detail=str(error), labels=["workload:unknown"])
         block["feature"] = feature
-    analysis = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("workload.py").read_bytes()).hexdigest()
+    analysis = hashlib.sha256(b"".join(Path(__file__).with_name(name).read_bytes()
+                                   for name in ("report.py", "workload.py", "latency_stats.py"))).hexdigest()
     # Windows scan these, not every record: diagnostics dominate long logs.
     sessions = [r for r in records if r.get("event") == "session"]
     telemetry = [r for r in records if r.get("event") in ("getblocktemplate", "resource_interval")]
@@ -157,13 +159,15 @@ def percentile(ordered, fraction):
 
 def latency(values):
     values = sorted(values)
-    return {"n": len(values), "median_ms": statistics.median(values) if values else None,
+    stats = summary(values) if values else {"mean": None, "median": None, "mode": None}
+    return {"n": len(values), "mean_ms": stats["mean"], "median_ms": stats["median"],
+            "mode_ms": stats["mode"],
             "p95_ms": percentile(values, .95) if len(values) >= 100 else None,
             "p99_ms": percentile(values, .99) if len(values) >= 100 else None}
 
 
 def interval(pairs):
-    """Resample whole occupied UTC five-minute clusters, never individual blocks."""
+    """Bootstrap the paired mean, resampling occupied UTC five-minute clusters."""
     groups = defaultdict(list)
     for at, delta in sorted(pairs):
         groups[at // WINDOW_MS].append(delta)
@@ -174,7 +178,7 @@ def interval(pairs):
     if len(clusters) < MIN_CLUSTERS:
         return "insufficient_clusters", result
     rng = random.Random(0)
-    samples = sorted(statistics.median([value for _ in clusters for value in rng.choice(clusters)])
+    samples = sorted(statistics.fmean(value for _ in clusters for value in rng.choice(clusters))
                      for _ in range(BOOTSTRAP_SAMPLES))
     result.update(lower_ms=percentile(samples, .025), upper_ms=percentile(samples, .975))
     return "exploratory", result
@@ -213,10 +217,12 @@ def selection(blocks, targets):
         lhs = [b["first"][left]["latency_ms"] for b in eligible]
         rhs = [b["first"][right]["latency_ms"] for b in eligible]
         deltas = [(b["at"], r - l) for b, l, r in zip(eligible, lhs, rhs)]
+        differences = [delta for _, delta in deltas]
         evidence, confidence = interval(deltas)
         pairs.append({"left": left, "right": right, "eligible_pairs": len(eligible),
                       "left_latency": latency(lhs), "right_latency": latency(rhs),
-                      "paired_right_minus_left_ms": statistics.median([d for _, d in deltas]) if deltas else None,
+                      "paired_mean_right_minus_left_ms": statistics.fmean(differences) if differences else None,
+                      "paired_median_right_minus_left_ms": statistics.median(differences) if differences else None,
                       "exclusions": dict(sorted(excluded.items())), "evidence": evidence, "interval": confidence})
     return {"blocks": len(blocks), "common_accepted_blocks": len(common), "pairs": pairs,
             "common_subset": {t: latency([b["first"][t]["latency_ms"] for b in common]) for t in targets}}

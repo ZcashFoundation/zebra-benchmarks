@@ -6,6 +6,7 @@ import struct
 import tempfile
 import unittest
 
+from latency_stats import half_sample_mode, paired
 import report
 from workload import COMPONENTS, GROUP_IDS, ParseError, THRESHOLDS, labels, parse_block
 
@@ -155,7 +156,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(len(pairs), 3)
         pair = pairs["a", "b"]
         self.assertEqual(pair["eligible_pairs"], 2)
-        self.assertEqual(pair["paired_right_minus_left_ms"], 6)
+        self.assertEqual(pair["paired_mean_right_minus_left_ms"], 6)
+        self.assertEqual(pair["paired_median_right_minus_left_ms"], 6)
         self.assertEqual(pair["evidence"], "insufficient_pairs")
         self.assertEqual(pair["exclusions"], {"a:catch_up": 1, "a:timeout": 1, "a:duplicate": 1, "dispatch_skew": 1})
         self.assertEqual(result["selection"]["common_accepted_blocks"], 0)
@@ -176,6 +178,9 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report.interval([(i, 7) for i in range(20)])[0], "insufficient_clusters")
         constant = [(i * report.WINDOW_MS, -3) for i in range(20)]
         self.assertEqual(report.interval(constant)[1], {"clusters": 20, "lower_ms": -3, "upper_ms": -3})
+        skewed = [(cluster * report.WINDOW_MS + index, 100 if cluster == 0 else 1)
+                  for cluster in range(12) for index in range(2)]
+        self.assertGreater(report.interval(skewed)[1]["upper_ms"], 1)
 
     def test_feature_errors_do_not_invent_zero_work(self):
         rows = [session(), attempt(0, "a", raw_block_hex="garbage"), attempt(0, "b")]
@@ -222,13 +227,19 @@ class ReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid interval"):
             report.validate(dict(baseline, valid=True, end_unix_ms=999))
 
-    def test_paired_median_is_not_difference_of_medians(self):
+    def test_paired_mean_is_not_median_or_difference_of_medians(self):
         rows = [session()]
         for number, (left, right) in enumerate(((1, 2), (100, 3), (101, 102))):
             rows.extend((attempt(number, "a", latency=left), attempt(number, "b", latency=right)))
         pair = report.make_report(rows, 0, report.WINDOW_MS)["selection"]["pairs"][0]
-        self.assertEqual(pair["paired_right_minus_left_ms"], 1)
+        self.assertAlmostEqual(pair["paired_mean_right_minus_left_ms"], -95 / 3)
+        self.assertEqual(pair["paired_median_right_minus_left_ms"], 1)
         self.assertEqual(pair["right_latency"]["median_ms"] - pair["left_latency"]["median_ms"], -97)
+        self.assertAlmostEqual(pair["left_latency"]["mean_ms"], 202 / 3)
+        self.assertEqual(report.latency([1, 1, 1, 50, 90])["mode_ms"], 1)
+        self.assertEqual(half_sample_mode([1, 2, 2.1, 2.5, 9]), 2.05)
+        self.assertEqual(paired([2, 2, 2], resamples=100),
+                         {"mean": 2, "median": 2, "mean_ci95": [2, 2]})
 
     def test_site_and_rolling_are_relative_to_log(self):
         latest = report.DAY_MS + 1000
@@ -248,6 +259,10 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(index["latest"], index["reports"][0]["report_id"])
             self.assertEqual(index["rolling"], "rolling.json")
             self.assertTrue((output / "index.html").is_file())
+            html = (output / "index.html").read_text()
+            self.assertIn("Mean right − left", html)
+            self.assertIn("paired_median_right_minus_left_ms", html)
+            self.assertIn("Half-sample mode", html)
             for entry in index["reports"]:
                 self.assertEqual(entry["start_unix_ms"] % report.WINDOW_MS, 0)
                 self.assertTrue((output / "reports" / entry["report_id"] / "report.json").is_file())

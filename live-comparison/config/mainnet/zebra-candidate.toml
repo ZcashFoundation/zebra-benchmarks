@@ -1,8 +1,8 @@
-# Optimized Zebra / 89390f741931b5238a8ef94a86810d89b3320f1b; isolated except for authenticated RPC.
-# Replace every /path/to path; use an independently synced state for this node.
+# Optimized Zebra / 89390f741931b5238a8ef94a86810d89b3320f1b; isolated except for the dispatcher's P2P observer and authenticated RPC.
+# Replace every /path/to path and miner address; bind only on a trusted LAN and firewall both ports to the dispatcher host.
 [network]
 network = "Mainnet"
-listen_addr = "127.0.0.1:28243"
+listen_addr = "0.0.0.0:28243"
 initial_mainnet_peers = []
 initial_testnet_peers = []
 cache_dir = false
@@ -12,6 +12,12 @@ cache_dir = "/path/to/live-comparison/mainnet/zebra-candidate/state"
 ephemeral = false
 
 [rpc]
-listen_addr = "127.0.0.1:28242"
+listen_addr = "0.0.0.0:28242"
 cookie_dir = "/path/to/live-comparison/mainnet/zebra-candidate/rpc"
 enable_cookie_auth = true
+
+[mempool]
+debug_enable_at_height = 0
+
+[mining]
+miner_address = "REPLACE_WITH_MAINNET_TRANSPARENT_ADDRESS"

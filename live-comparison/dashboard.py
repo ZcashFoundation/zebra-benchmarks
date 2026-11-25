@@ -12,6 +12,7 @@ import statistics
 import sys
 import tomllib
 
+from latency_stats import paired, summary
 import report
 from load_intervals import merge_intervals
 
@@ -41,28 +42,42 @@ def short_build_label(version):
     return " ".join(re.sub(r"\s*\(", ", ", label).replace(")", "").split()).strip(" ,;")
 
 
+def latency_summary(blocks, target):
+    values = [b["first"][target]["latency_ms"] for b in blocks]
+    stats = summary(values) if values else {"mean": None, "median": None, "mode": None}
+    return {"n": len(values), **{f"{name}_ms": value for name, value in stats.items()}}
+
+
 def glance_comparisons(blocks):
-    """Same-block comparator / candidate ratios and comparator − candidate savings."""
+    """Same-block comparator / candidate ratios and signed paired savings."""
     comparisons = {}
     for target in (TARGETS[1], TARGETS[0]):
         pairs = [(b["first"][target]["latency_ms"], b["first"][TARGETS[2]]["latency_ms"])
                  for b in blocks]
         ratios = [a / b for a, b in pairs if b != 0]
-        comparisons[target] = {"ratio": statistics.median(ratios) if ratios else None, "n": len(ratios),
-                               "saving_ms": statistics.median([a - b for a, b in pairs]) if pairs else None,
+        differences = [a - b for a, b in pairs]
+        stats = paired(differences, resamples=report.BOOTSTRAP_SAMPLES) if differences else None
+        comparisons[target] = {"ratio": statistics.fmean(ratios) if ratios else None, "n": len(ratios),
+                               "saving_ms": stats["mean"] if stats else None,
+                               "saving_ci95_ms": stats["mean_ci95"] if stats else None,
+                               "saving_median_ms": stats["median"] if stats else None,
                                "saving_n": len(pairs)}
     return comparisons
 
 
-def rolling_medians(points):
-    """Trailing 15-block medians; break and reset after gaps longer than 10 minutes."""
+def rolling_means(points):
+    """Trailing 15-block means; break and reset after gaps longer than 10 minutes."""
     window, trend = deque(maxlen=15), []
     for point in points:
         if window and point[2] - window[-1][2] > 10 * 60 * 1000:
             trend.append([point[2], None, None, None])
             window.clear()
         window.append(point)
-        trend.append([point[2], *[statistics.median(p[i + 3] for p in window) for i in range(3)]])
+        means = []
+        for i in range(3):
+            values = [p[i + 3] for p in window if p[i + 3] > 0]
+            means.append(statistics.fmean(values) if values else None)
+        trend.append([point[2], *means])
     return trend
 
 
@@ -158,19 +173,18 @@ def collect(path, config=None, load_intervals=None, network="Mainnet", covered_u
     by_size, size_comparisons = {}, {}
     for label in ("All sizes", *BINS):
         subset = [b for b in accepted if label == "All sizes" or size_bin(b["size"]) == label]
-        by_size[label] = {"n": len(subset), "medians": {
-            t: statistics.median([b["first"][t]["latency_ms"] for b in subset]) if subset else None for t in TARGETS}}
+        nodes = {t: latency_summary(subset, t) for t in TARGETS}
+        by_size[label] = {"n": len(subset),
+                          **{name + "s": {t: node[name + "_ms"] for t, node in nodes.items()}
+                             for name in ("mean", "median", "mode")}}
         size_comparisons[label] = glance_comparisons(subset)
     quiet_blocks = [b for b in accepted if busy(b["at"]) is False]
-    quiet = {"nodes": {target: {"n": len(quiet_blocks), "median_ms": statistics.median(
-        [b["first"][target]["latency_ms"] for b in quiet_blocks]) if quiet_blocks else None} for target in TARGETS},
-        "comparisons": glance_comparisons(quiet_blocks)}
+    quiet = {"nodes": {target: latency_summary(quiet_blocks, target) for target in TARGETS},
+             "comparisons": glance_comparisons(quiet_blocks)}
     glance_end = max((b["at"] for b in blocks.values()), default=None)
     glance_start = glance_end - 24 * 60 * 60 * 1000 if glance_end is not None else None
     glance_blocks = [b for b in accepted if b["at"] >= glance_start]
-    glance_nodes = {target: {"n": len(glance_blocks), "median_ms": statistics.median(
-        [b["first"][target]["latency_ms"] for b in glance_blocks]) if glance_blocks else None}
-        for target in TARGETS}
+    glance_nodes = {target: latency_summary(glance_blocks, target) for target in TARGETS}
     glance_points = [[b["height"], b["size"], b["at"],
                       *[b["first"][t]["latency_ms"] for t in TARGETS]] for b in glance_blocks]
     chart_start = glance_points[0][2] if glance_points else glance_end
@@ -184,7 +198,7 @@ def collect(path, config=None, load_intervals=None, network="Mainnet", covered_u
                        "chart_start": utc(chart_start), "nodes": glance_nodes,
                        "comparisons": glance_comparisons(glance_blocks), "bins": size_comparisons,
                        "recent": list(reversed(per_block[-10:])),
-                       "points": glance_points, "trend": rolling_medians(glance_points)},
+                       "points": glance_points, "trend": rolling_means(glance_points)},
             "targets": TARGETS, "labels": LABELS, "colors": COLORS, "dark_colors": DARK_COLORS}
 
 
@@ -212,12 +226,17 @@ def comparison_text(ratio):
 
 def saving_text(value):
     if value is None:
-        return "Median difference unavailable"
+        return "Difference unavailable"
     if abs(value) < .05:
-        return "Median difference < 0.05 ms per block"
+        return "Difference < 0.05 ms per block"
     magnitude = abs(value)
     amount = f"{magnitude:.2f}" if magnitude < 1 else f"{magnitude:.1f}" if magnitude < 10 else f"{magnitude:.0f}"
     return f'{"Saves" if value > 0 else "Adds"} {amount} ms per block'
+
+
+def ci_text(interval):
+    return (f'bootstrap 95% CI [{interval[0]:+.3g}, {interval[1]:+.3g}] ms'
+            if interval is not None else 'bootstrap 95% CI unavailable')
 
 
 def render(data):
@@ -232,14 +251,18 @@ def render(data):
     colors, dark_colors = dict(zip(TARGETS, COLORS)), dict(zip(TARGETS, DARK_COLORS))
     size_rows = []
     for label, summary in data["mixed_load"].items():
-        cells = "".join(f'<td>{ms(summary["medians"][target])}</td>' for target in ORDER)
+        cells = "".join(
+            f'<td>{ms(summary["means"][target])}<br><small>median {ms(summary["medians"][target])}; '
+            f'half-sample mode {ms(summary["modes"][target])}</small></td>' for target in ORDER)
         ratio_cells = []
         for comparison in glance["bins"][label].values():
             ratio = comparison["ratio"]
             label_text = comparison_text(ratio)
             if label_text == "Within 5%":
                 label_text = f"within 5% ({ratio_text(ratio)}×)"
-            ratio_cells.append(f'<td><strong>{label_text}</strong></td>')
+            ratio_cells.append(f'<td><strong>{label_text}</strong><br><small>Mean: {escape(saving_text(comparison["saving_ms"]))}; '
+                               f'{ci_text(comparison["saving_ci95_ms"])}; '
+                               f'median: {escape(saving_text(comparison["saving_median_ms"]))}</small></td>')
         size_rows.append(f'<tr><th scope="row">{escape(label)}</th><td>{summary["n"]}</td>{cells}{"".join(ratio_cells)}</tr>')
     latest_block = glance["recent"][0] if glance["recent"] else None
     quiet = data["quiet"]
@@ -249,15 +272,20 @@ def render(data):
         latest_ms = latest_block["latency_ms"][target] if latest_block else None
         latest_label = f'Latest block {latest_block["height"]:,}' if latest_block else "Latest block"
         tiles.append(f'<article class="glance-tile" style="--node:{colors[target]};--node-dark:{dark_colors[target]}"><h3>{labels[target]}</h3>'
-                     f'<p class="glance-metric">{ms(node["median_ms"])} <small>ms</small></p>'
-                     f'<p>Median, last 24 h ({node["n"]} blocks)</p>'
-                     f'<p>Quiet host, all records: <strong>{ms(quiet_node["median_ms"])} ms</strong> ({quiet_node["n"]} blocks)</p>'
+                     f'<p class="glance-metric">{ms(node["mean_ms"])} <small>ms</small></p>'
+                     f'<p>Mean, last 24 h ({node["n"]} blocks)</p>'
+                     f'<p>Median {ms(node["median_ms"])} ms; half-sample mode {ms(node["mode_ms"])} ms</p>'
+                     f'<p>Quiet host, all records: <strong>{ms(quiet_node["mean_ms"])} ms</strong> ({quiet_node["n"]} blocks); '
+                     f'median {ms(quiet_node["median_ms"])} ms; half-sample mode {ms(quiet_node["mode_ms"])} ms</p>'
                      f'<p>{latest_label}: <strong>{ms(latest_ms)} ms</strong></p></article>')
     for target, comparison in glance["comparisons"].items():
         quiet_comparison = quiet["comparisons"][target]
         headline_rows.append(f'<div><p class="glance-ratio">{comparison_text(comparison["ratio"])}</p><p>Optimized Zebra vs {labels[target]}</p>'
-                             f'<p><strong>{escape(saving_text(comparison["saving_ms"]))}</strong> (median of {comparison["saving_n"]} blocks)</p>'
-                             f'<p class="note">Quiet host, all records: {comparison_text(quiet_comparison["ratio"])} ({quiet_comparison["saving_n"]} blocks)</p></div>')
+                             f'<p><strong>Mean: {escape(saving_text(comparison["saving_ms"]))}</strong> ({comparison["saving_n"]} paired blocks); '
+                             f'{ci_text(comparison["saving_ci95_ms"])}; median: {escape(saving_text(comparison["saving_median_ms"]))}</p>'
+                             f'<p class="note">Quiet host, all records: {comparison_text(quiet_comparison["ratio"])} '
+                             f'({quiet_comparison["saving_n"]} paired blocks); mean: {escape(saving_text(quiet_comparison["saving_ms"]))}; '
+                             f'{ci_text(quiet_comparison["saving_ci95_ms"])}; median: {escape(saving_text(quiet_comparison["saving_median_ms"]))}</p></div>')
     for row in glance["recent"]:
         cells = "".join(f'<td>{ms(row["latency_ms"][target])}</td>' for target in ORDER)
         recent_rows.append(f'<tr><th scope="row" title="{row["hash"]}">{row["height"]:,}</th>'
@@ -271,13 +299,13 @@ def render(data):
 <header><div class="page-heading"><h1>Zebra perf stats</h1><nav class="network-tabs" aria-label="Network">{navigation}</nav></div>
 <p class="note">{"SYNTHETIC DATA — not real measurements · " if data["synthetic"] else ""}Updated {data["generated_at"]}</p></header>
 <section aria-labelledby="glance"><h2 id="glance">Block submission latency</h2>
-<p>Each new {network} block is submitted to all three nodes concurrently via <code>submitblock</code>. Latency is the RPC round trip of each node's first attempt; speed-ups and savings are medians over the same blocks. Figures cover the last 24 hours unless marked otherwise. Quiet-host figures use only blocks dispatched outside recorded host-load intervals (±30 s).</p>
+<p>Each new {network} block is submitted to all three nodes concurrently via <code>submitblock</code>. Latency is the RPC round trip of each node's first attempt. Mean latency and mean same-block speed-ups and savings are headlines (slow rounds matter); medians and half-sample modes show their effect. Speed-up ratios omit blocks with zero Optimized Zebra latency, but paired savings include them. Savings are comparator minus Optimized Zebra; bootstrap 95% intervals resample paired blocks. Figures cover the last 24 hours unless marked otherwise. Quiet-host figures use only blocks dispatched outside recorded host-load intervals (±30 s).</p>
 <div class="glance-headlines">{"".join(headline_rows)}</div>
 <div class="glance-tiles">{"".join(tiles)}</div>
 <h3>Latency, last 24 h</h3>
 <p id="glance-chart-status" class="note" role="status">{"No blocks in the last 24 hours. " if not glance["points"] else ""}The chart requires JavaScript.</p>
-<figure><div id="glance-chart" class="chart" role="img" aria-label="Submission latency over the last 24 hours"></div><figcaption>Points are individual blocks; lines are rolling medians over 15 blocks. Shading marks recorded host load.</figcaption></figure>
-<div class="table-wrap" tabindex="0" role="region" aria-label="Latency by block size"><table><caption>Median latency by block size, all records (ms)</caption><thead><tr><th scope="col">Size</th><th scope="col">Blocks</th>{heads}<th scope="col">Optimized vs Zebra v7.0.0</th><th scope="col">Optimized vs Zakura</th></tr></thead><tbody>{"".join(size_rows)}</tbody></table></div>
+<figure><div id="glance-chart" class="chart" role="img" aria-label="Submission latency over the last 24 hours"></div><figcaption>Points are individual blocks; lines are rolling means over 15 blocks. Shading marks recorded host load.</figcaption></figure>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Latency by block size"><table><caption>Mean, median and half-sample mode latency by block size, all records (ms)</caption><thead><tr><th scope="col">Size</th><th scope="col">Blocks</th>{heads}<th scope="col">Optimized vs Zebra v7.0.0</th><th scope="col">Optimized vs Zakura</th></tr></thead><tbody>{"".join(size_rows)}</tbody></table></div>
 <figure><div id="size-chart" class="chart" role="img" aria-label="Submission latency by block size"></div><figcaption>Latency against serialized block size for every block accepted by all three nodes, all records.</figcaption></figure>
 <div class="table-wrap" tabindex="0" role="region" aria-label="Latest blocks"><table><caption>Latest 10 blocks (ms)</caption><thead><tr><th scope="col">Height</th><th scope="col">kB</th>{heads}<th scope="col">Host</th></tr></thead><tbody>{"".join(recent_rows) or '<tr><td colspan="6">No blocks yet.</td></tr>'}</tbody></table></div></section>
 <section aria-labelledby="how"><h2 id="how">Method</h2>
@@ -326,7 +354,7 @@ const logAxis={type:'log',dtick:1,tickformat:'~g',minor:{dtick:'D1',showgrid:tru
 function series(i){return {name:names[i],marker:{color:colors[i],size:5,opacity:.7,symbol:i===0?'diamond':'circle'},line:{color:colors[i],width:2.75,dash:i===0?'dash':'solid'}}}
 const loadShapes=d.load_intervals.map(([a,b])=>({type:'rect',xref:'x',yref:'paper',x0:new Date(a).toISOString(),x1:new Date(b).toISOString(),y0:0,y1:1,fillcolor:theme.text,opacity:.06,line:{width:0},layer:'below'}));
 const glanceTraces=order.map(i=>{const target=d.targets[i], rows=d.glance.points.filter(p=>p[i+3]>0);return {...series(i),type:'scatter',mode:'markers',legendgroup:target,showlegend:false,marker:{...series(i).marker,opacity:.45},x:rows.map(p=>new Date(p[2]).toISOString()),y:rows.map(p=>p[i+3]),customdata:rows.map(p=>[p[0],p[1]/1000]),hovertemplate:'Height %{customdata[0]:,.0f}<br>Size %{customdata[1]:.3f} kB<br>%{y:.3f} ms<br>%{x}<extra>%{fullData.name}</extra>'}});
-glanceTraces.push(...order.map(i=>({...series(i),type:'scatter',mode:'lines',legendgroup:d.targets[i],connectgaps:false,x:d.glance.trend.map(p=>new Date(p[0]).toISOString()),y:d.glance.trend.map(p=>p[i+1]>0?p[i+1]:null),hovertemplate:'Rolling median (15 blocks)<br>%{y:.3f} ms<br>%{x}<extra>%{fullData.name}</extra>'})));
+glanceTraces.push(...order.map(i=>({...series(i),type:'scatter',mode:'lines',legendgroup:d.targets[i],connectgaps:false,x:d.glance.trend.map(p=>new Date(p[0]).toISOString()),y:d.glance.trend.map(p=>p[i+1]>0?p[i+1]:null),hovertemplate:'Rolling mean (15 blocks)<br>%{y:.3f} ms<br>%{x}<extra>%{fullData.name}</extra>'})));
 const sizeTraces=order.map(i=>{const rows=d.points.filter(p=>p[i+3]>0);return {...series(i),type:'scatter',mode:'markers',x:rows.map(p=>p[1]/1000),y:rows.map(p=>p[i+3]),customdata:rows.map(p=>p[0]),hovertemplate:'Height %{customdata:,.0f}<br>%{x:.1f} kB<br>%{y:.3f} ms<extra>%{fullData.name}</extra>'}});
 Promise.all([Plotly.react('glance-chart',glanceTraces,{...layout,xaxis:{...layout.xaxis,type:'date',title:'Dispatch time (UTC)',range:d.glance.points.length?[d.glance.chart_start,d.glance.window_end]:undefined},yaxis:{...layout.yaxis,...logAxis,title:'Latency (ms)'},shapes:loadShapes},config),
   Plotly.react('size-chart',sizeTraces,{...layout,xaxis:{...layout.xaxis,title:'Block size (kB)'},yaxis:{...layout.yaxis,...logAxis,title:'Latency (ms)'}},config)]).then(()=>{document.getElementById('glance-chart-status').textContent=d.glance.points.length?'':'No blocks in the last 24 hours.'}).catch(()=>{document.getElementById('glance-chart-status').textContent='The charts could not be rendered; the tables contain the same figures.'});

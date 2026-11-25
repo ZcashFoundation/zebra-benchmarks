@@ -18,9 +18,10 @@ import time
 import unittest
 import tomllib
 
-import dispatch
 import dashboard
+import dispatch
 import load_intervals
+from observer import MAX_MESSAGE, _messages, announcements
 
 
 def make_chain(count):
@@ -95,6 +96,8 @@ class FakeNode:
     def call(self, method, params):
         with self.lock:
             self.calls.append((method, time.monotonic()))
+        if method == "getblockcount":
+            return self.height
         if method == "getbestblockhash":
             return self.chain[self.height]["hash"]
         if method == "getblockhash":
@@ -199,6 +202,47 @@ class DispatchTests(unittest.TestCase):
         for code, label in [(-25, "rejected"), (-26, "rejected"), (-27, "duplicate"),
                             (-32603, "error")]:
             self.assertEqual(dispatch.outcome(error=dispatch.RPCError({"code": code}))[0], label)
+
+    def test_observer_inventory_and_message_limit(self):
+        block = bytes(range(32))
+        payload = (b"\x03" + struct.pack("<I", 5) + bytes(64) +
+                   struct.pack("<I", 2) + block + struct.pack("<I", 1) + bytes(32))
+        self.assertEqual(announcements("inv", payload), [block[::-1].hex()])
+        with self.assertRaisesRegex(ValueError, "invalid block inventory"):
+            announcements("inv", payload[:-1])
+        header = (bytes.fromhex("24e92764") + b"inv".ljust(12, b"\0") +
+                  struct.pack("<I", MAX_MESSAGE + 1) + bytes(4))
+
+        class Socket:
+            def recv(self, _):
+                return header
+
+        with self.assertRaisesRegex(ValueError, "invalid P2P message header"):
+            next(_messages(Socket(), bytes.fromhex("24e92764"), threading.Event(), threading.Event()))
+
+    def test_mempool_diff_forgets_departed_transactions(self):
+        seen = {"a", "b"}
+        current = {"b", "c"}
+        self.assertEqual(dispatch.new_txids(seen, current), {"c"})
+        seen.intersection_update(current)
+        self.assertEqual(dispatch.new_txids(seen, {"a", "b"}), {"a"})
+
+    def test_submit_paths_uses_one_clock_and_preserves_missing_milestones(self):
+        block = dispatch.Block("ab" * 32, 42, "cd" * 32, "00" * 150, 700, False)
+        node = {"name": "candidate", "client": "Zebra", "version": "test"}
+        row = dispatch.submit_paths(block, node, 710, 1_000_000_000,
+                                    {"submit_return": 1_012_000_000,
+                                     "tip": 1_009_000_000, "template": None,
+                                     "peer_told": 1_011_000_000, "peer_has": 1_013_000_000},
+                                    "accepted", None, 3.5)
+        self.assertEqual(row["event"], "submit_paths")
+        self.assertEqual(row["dispatch_unix_ms"], 710)
+        self.assertEqual(row["rpc_round_trip_ms"], 3.5)
+        self.assertEqual([row[key] for key in
+                          ("submit_return_ms", "tip_ms", "peer_told_ms", "peer_has_ms")],
+                         [12, 9, 11, 13])
+        self.assertIsNone(row["template_ms"])
+
 
     def test_concurrent_dispatch_and_samples(self):
         chain = make_chain(3)
@@ -341,9 +385,12 @@ class DispatchTests(unittest.TestCase):
                     self.assertEqual(network["network"], network_name)
                     self.assertFalse(state["ephemeral"])
                     self.assertTrue(rpc["enable_cookie_auth"])
-                    self.assertEqual(endpoint["url"], f'http://{rpc["listen_addr"]}')
-                    self.assertEqual(Path(endpoint["cookie"]), Path(rpc["cookie_dir"]) / ".cookie")
-                    self.assertNotIn("auth", endpoint)
+                    if network_name == "Mainnet":
+                        self.assertEqual(endpoint["url"].rsplit(":", 1)[1], rpc["listen_addr"].rsplit(":", 1)[1])
+                        self.assertTrue(endpoint["cookie"])
+                    else:
+                        self.assertEqual(endpoint["url"], f'http://{rpc["listen_addr"]}')
+                        self.assertEqual(Path(endpoint["cookie"]), Path(rpc["cookie_dir"]) / ".cookie")
                     self.assertNotIn("pid", endpoint)  # Operators supply current process IDs.
                     for address in (network["listen_addr"], rpc["listen_addr"]):
                         port = address.rsplit(":", 1)[1]
@@ -361,13 +408,22 @@ class DispatchTests(unittest.TestCase):
                         self.assertEqual(network["initial_mainnet_peers"], [])
                         self.assertEqual(network["initial_testnet_peers"], [])
                         self.assertFalse(network["cache_dir"])
-                        self.assertTrue(network["listen_addr"].startswith("127.0.0.1:"))
+                        if network_name == "Mainnet":
+                            self.assertEqual(endpoint["p2p"].rsplit(":", 1)[1],
+                                             network["listen_addr"].rsplit(":", 1)[1])
+                        else:
+                            self.assertTrue(network["listen_addr"].startswith("127.0.0.1:"))
                     if name == "zakura":
                         self.assertEqual(network["p2p_stack"], "legacy")
                         self.assertEqual(state["storage_mode"]["pruned"]["tx_retention"], 10000)
                         bootstrap = tomllib.loads((examples / "zakura-bootstrap.toml").read_text())
-                        for key in ("state", "rpc"):
-                            self.assertEqual(bootstrap[key], node_config[key])
+                        self.assertEqual(bootstrap["state"], node_config["state"])
+                        if network_name == "Mainnet":
+                            self.assertEqual(bootstrap["rpc"]["listen_addr"], "127.0.0.1:29232")
+                            self.assertEqual({k: v for k, v in bootstrap["rpc"].items() if k != "listen_addr"},
+                                             {k: v for k, v in rpc.items() if k != "listen_addr"})
+                        else:
+                            self.assertEqual(bootstrap["rpc"], rpc)
                         self.assertEqual(bootstrap["network"]["identity_dir"], network["identity_dir"])
                         self.assertNotIn(f"initial_{network_name.lower()}_peers", bootstrap["network"])
 

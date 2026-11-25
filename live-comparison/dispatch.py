@@ -4,12 +4,15 @@
 import argparse
 import base64
 from dataclasses import dataclass, field
+import http.client
 import json
 import math
 import os
 from pathlib import Path
+import queue
 import signal
 import socket
+import statistics
 import sys
 import threading
 import time
@@ -18,6 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from observer import Peer, TemplateWatch, header_hash
 MAX_BLOCK_BYTES = 2_000_000
 MAX_RESPONSE_BYTES = 8_000_000
 
@@ -35,7 +39,17 @@ class RPCError(Exception):
 class RPC:
     def __init__(self, config, timeout=10):
         self.config = config
+        self._longpoll = None
         self.timeout = timeout
+
+    def headers(self):
+        headers = {"Content-Type": "application/json"}
+        auth = self.config.get("auth")
+        if self.config.get("cookie"):
+            auth = Path(self.config["cookie"]).read_text().strip()
+        if auth:
+            headers["Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
+        return headers
 
     def call(self, method, params=None, timeout=None):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
@@ -43,29 +57,52 @@ class RPC:
         return self.request(body, timeout)
 
     def request(self, body, timeout=None):
-        headers = {"Content-Type": "application/json"}
-        auth = self.config.get("auth")
-        if self.config.get("cookie"):
-            auth = Path(self.config["cookie"]).read_text().strip()
-        if auth:
-            headers["Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
-        request = urllib.request.Request(self.config["url"], data=body, headers=headers)
+        request = urllib.request.Request(self.config["url"], data=body, headers=self.headers())
         try:
             response = urllib.request.urlopen(request, timeout=timeout or self.timeout)
         except urllib.error.HTTPError as error:
             response = error
         with response:
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise ValueError("RPC response exceeds size limit")
-            result = json.loads(raw)
-            if not isinstance(result, dict) or result.get("id") != 1:
-                raise ValueError("invalid JSON-RPC response envelope")
-            if result.get("error") is not None:
-                raise RPCError(result["error"])
-            if response.status != 200 or "result" not in result:
-                raise ValueError(f"invalid JSON-RPC response (HTTP {response.status})")
-            return result["result"]
+            return self.parse(response)
+
+    @staticmethod
+    def parse(response):
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ValueError("RPC response exceeds size limit")
+        result = json.loads(raw)
+        if not isinstance(result, dict) or result.get("id") != 1:
+            raise ValueError("invalid JSON-RPC response envelope")
+        if result.get("error") is not None:
+            raise RPCError(result["error"])
+        if response.status != 200 or "result" not in result:
+            raise ValueError(f"invalid JSON-RPC response (HTTP {response.status})")
+        return result["result"]
+
+    def cancel_longpoll(self):
+        connection = self._longpoll
+        if connection is not None and connection.sock is not None:
+            try:
+                connection.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+    def longpoll(self, longpoll_id, on_sent):
+        """Signal only after the dedicated RPC connection has sent its long poll."""
+        url = urllib.parse.urlsplit(self.config["url"])
+        connection = (http.client.HTTPSConnection if url.scheme == "https" else
+                      http.client.HTTPConnection)(url.hostname, url.port, timeout=30)
+        self._longpoll = connection
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getblocktemplate",
+                           "params": [{"longpollid": longpoll_id}]}).encode()
+        try:
+            connection.request("POST", url.path or "/", body, self.headers())
+            on_sent()
+            return self.parse(connection.getresponse())
+        finally:
+            self._longpoll = None
+            connection.close()
 
 
 def outcome(result=None, error=None):
@@ -90,6 +127,29 @@ def outcome(result=None, error=None):
     return "error", f"unexpected submitblock result: {result!r}"
 
 
+def new_txids(previous, current):
+    return set(current) - set(previous)
+
+
+def submit_paths(block, node, dispatch, started, stamps, label, detail, rpc_round_trip_ms):
+    return {"event": "submit_paths", "hash": block.hash, "height": block.height,
+            "block_bytes": len(block.raw) // 2, "target": node["name"],
+            "client": node["client"], "version": node["version"],
+            "queued_unix_ms": block.queued, "dispatch_unix_ms": dispatch,
+            "observed_at_unix_ms": now_ms(), "outcome": label, "detail": detail,
+            "catch_up": False, "rpc_round_trip_ms": rpc_round_trip_ms,
+            **{name + "_ms": (stamp - started) / 1_000_000 if stamp is not None and stamp >= started
+               else None for name, stamp in stamps.items()}}
+
+
+def rpc_round_trip(rpc):
+    values = []
+    for _ in range(10):
+        started = time.perf_counter_ns()
+        rpc.call("getblockcount")
+        values.append((time.perf_counter_ns() - started) / 1_000_000)
+    return statistics.median(values)
+
 def load_config(path):
     path = Path(path)
     with path.open("rb") as source:
@@ -102,6 +162,13 @@ def load_config(path):
         value = config.setdefault(key, default)
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"{key} must be finite and positive")
+    if type(config.setdefault("mirror_mempool", False)) is not bool:
+        raise ValueError("mirror_mempool must be boolean")
+    poll = config.setdefault("mempool_poll_seconds", .25)
+    if type(poll) not in (int, float) or not math.isfinite(poll) or poll <= 0:
+        raise ValueError("mempool_poll_seconds must be finite and positive")
+    if config.setdefault("network", "mainnet") not in ("mainnet", "testnet", "regtest"):
+        raise ValueError("network must be mainnet, testnet, or regtest")
     contestants = config.get("contestants", [])
     if not contestants or not isinstance(contestants, list):
         raise ValueError("at least one contestant is required")
@@ -127,12 +194,22 @@ def load_config(path):
             raise ValueError("contestants require nonempty name, client, and version")
         if "pid" in node and (type(node["pid"]) is not int or node["pid"] <= 0):
             raise ValueError("pid must be a positive local process id")
+        if "p2p" in node:
+            address = node["p2p"]
+            if not isinstance(address, str) or ":" not in address:
+                raise ValueError("p2p must be host:port")
+            host, port = address.rsplit(":", 1)
+            if not host.strip("[]") or not port.isdecimal() or not 0 < int(port) < 65536:
+                raise ValueError("p2p must be host:port")
         names.append(node["name"])
     if len(set(names)) != len(names):
         raise ValueError("contestant names must be unique")
     urls = [node["url"].rstrip("/") for node in [config["feeder"], *contestants]]
     if len(set(urls)) != len(urls):
         raise ValueError("feeder and contestants must use distinct RPC endpoints")
+    addresses = [node["p2p"] for node in contestants if "p2p" in node]
+    if len(set(addresses)) != len(addresses):
+        raise ValueError("contestant P2P addresses must be distinct")
     return config
 
 
@@ -220,17 +297,68 @@ class Dispatcher:
         thread.start()
         self.threads.append(thread)
 
-    def submit(self, rpc, node, block, catch_up):
+    def tip_watch(self, node, block_hash, start, observed, errors):
+        rpc = RPC(node, self.config["rpc_timeout_seconds"])
+        start.wait()
+        deadline = time.monotonic() + self.config["template_timeout_seconds"]
+        while not self.stop.is_set() and time.monotonic() < deadline:
+            try:
+                if rpc.call("getbestblockhash") == block_hash:
+                    observed["tip"] = time.perf_counter_ns()
+                    return
+            except (OSError, ValueError, RPCError) as error:
+                errors.append(f"tip poll: {error}")
+            self.stop.wait(.001)
+        if not self.stop.is_set():
+            errors.append("tip poll: timed out")
+
+    def submit(self, rpc, node, block, catch_up, peer=None, template=None):
+        timeout = self.config["template_timeout_seconds"]
+        errors = []
+        round_trip = None
+        peer_ready = False
+        template_ready = False
+        if not catch_up:
+            try:
+                round_trip = rpc_round_trip(rpc)
+            except (OSError, ValueError, RPCError) as error:
+                errors.append(f"RPC round trip: {error}")
+            if peer is not None:
+                peer_ready = peer.ready.wait(timeout)
+                if not peer_ready:
+                    errors.append(f"P2P observer not ready: {peer.errors[-3:]}")
+            if template is not None:
+                if template.errors and not template.ready.is_set():
+                    errors.append(f"template long poll: {template.errors[-1]}")
+                else:
+                    try:
+                        template.prepare(block.previous, timeout)
+                        template_ready = True
+                    except TimeoutError as error:
+                        errors.append(f"template long poll: {error}")
+        start = threading.Event()
+        observed = {}
+        watcher = None
+        if not catch_up:
+            watcher = threading.Thread(target=self.tip_watch,
+                                       args=(node, block.hash, start, observed, errors), daemon=True)
+            watcher.start()
         dispatch = now_ms()
         started = time.perf_counter_ns()
+        start.set()
         result = None
         error = None
         try:
             result = rpc.request(block.body)
         except (OSError, ValueError, RPCError) as exc:
             error = exc
-        latency = (time.perf_counter_ns() - started) / 1_000_000
+        returned = time.perf_counter_ns()
+        latency = (returned - started) / 1_000_000
         label, detail = outcome(result, error)
+        if peer is not None and label == "accepted":
+            raw = bytes.fromhex(block.raw)
+            _, end = header_hash(raw)
+            peer.set_tip(block.hash, raw[:end])
         self.sink.record({"event": "submitblock_call", "hash": block.hash,
                           "height": block.height, "block_bytes": len(block.raw) // 2,
                           "raw_block_hex": block.raw, "target": node["name"],
@@ -247,6 +375,26 @@ class Dispatcher:
                     self.sink.record({"event": "dispatch_skew", "hash": block.hash,
                                       "height": block.height, "dispatch_skew_ms": skew,
                                       "at_unix_ms": now_ms()})
+            watcher.join(timeout + .1)
+            deadline = time.monotonic() + timeout
+            if template_ready or peer_ready:
+                while not self.stop.is_set() and time.monotonic() < deadline:
+                    seen = peer.observed.get(block.hash, {}) if peer is not None else {}
+                    template_done = not template_ready or block.hash in template.observed
+                    peer_done = not peer_ready or seen.get("peer_has_ns") is not None
+                    if template_done and peer_done:
+                        break
+                    self.stop.wait(.005)
+            seen = peer.observed.get(block.hash, {}) if peer is not None else {}
+            stamps = {"submit_return": returned, "tip": observed.get("tip"),
+                      "template": template.observed.get(block.hash) if template else None,
+                      "peer_told": seen.get("peer_told_ns"), "peer_has": seen.get("peer_has_ns")}
+            self.sink.record(submit_paths(block, node, dispatch, started, stamps,
+                                          label, detail, round_trip))
+            for diagnostic in errors:
+                self.diagnostic(node["name"], diagnostic)
+            if peer is not None and peer.errors:
+                self.diagnostic(node["name"], f"P2P observer: {peer.errors[-1]}")
         return label, detail
 
     def catch_up(self, rpc, node, tip, block):
@@ -275,34 +423,142 @@ class Dispatcher:
 
     def contestant(self, node):
         rpc = RPC(node, self.config["rpc_timeout_seconds"])
-        tip = None
-        generation = -1
-        synced = False
-        while not self.stop.is_set():
-            with self.changed:
-                self.changed.wait_for(lambda: self.stop.is_set() or
-                                      (self.latest and self.latest.generation != generation), .5)
-                block = self.latest
-            if self.stop.is_set():
-                break
-            if block is None:
-                continue
-            try:
-                live = (synced and tip == block.previous and not block.catch_up and
-                        generation + 1 == block.generation)
-                generation = block.generation
-                if live:
-                    label, detail = self.submit(rpc, node, block, False)
-                    synced = label == "accepted"
-                    tip = block.hash if synced else None
-                else:
-                    tip = rpc.call("getbestblockhash")
-                    synced = tip == block.hash or self.catch_up(rpc, node, tip, block)
-                    tip = block.hash if synced else None
-            except (OSError, ValueError, RPCError, KeyError) as error:
-                synced, tip = False, None
-                self.diagnostic(node["name"], error)
-            # Failed targets retry on the periodic wakeup, without blocking the feeder or peers.
+        peer = None
+        template = TemplateWatch(lambda: RPC(node, self.config["rpc_timeout_seconds"]),
+                                 lambda error: self.diagnostic(node["name"], f"template long poll: {error}"))
+        try:
+            if "p2p" in node:
+                tip_hash = rpc.call("getbestblockhash")
+                raw = bytes.fromhex(rpc.call("getblock", [tip_hash, 0]))
+                _, end = header_hash(raw)
+                peer = Peer(node["p2p"], self.config["network"], tip_hash, raw[:end])
+                peer.start()
+            template.start()
+            tip = None
+            generation = -1
+            synced = False
+            while not self.stop.is_set():
+                with self.changed:
+                    self.changed.wait_for(lambda: self.stop.is_set() or
+                                          (self.latest and self.latest.generation != generation), .5)
+                    block = self.latest
+                if self.stop.is_set():
+                    break
+                if block is None:
+                    continue
+                try:
+                    live = (synced and tip == block.previous and not block.catch_up and
+                            generation + 1 == block.generation)
+                    generation = block.generation
+                    if live:
+                        label, detail = self.submit(rpc, node, block, False, peer, template)
+                        synced = label == "accepted"
+                        tip = block.hash if synced else None
+                    else:
+                        tip = rpc.call("getbestblockhash")
+                        synced = tip == block.hash or self.catch_up(rpc, node, tip, block)
+                        tip = block.hash if synced else None
+                        if synced and peer is not None:
+                            raw = bytes.fromhex(block.raw)
+                            _, end = header_hash(raw)
+                            peer.set_tip(block.hash, raw[:end])
+                except (OSError, ValueError, RPCError, KeyError) as error:
+                    synced, tip = False, None
+                    self.diagnostic(node["name"], error)
+                # Failed targets retry on the periodic wakeup, without blocking the feeder or peers.
+        finally:
+            template.stop()
+            if peer is not None:
+                peer.stop()
+
+    def mirror(self, _):
+        nodes = self.config["contestants"]
+        channels = {node["name"]: queue.Queue(maxsize=10_000) for node in nodes}
+        status = {node["name"]: {"pending": set(), "accepted": set()} for node in nodes}
+        lock = threading.Lock()
+        current = set()
+
+        def sender(node):
+            rpc = RPC(node, self.config["rpc_timeout_seconds"])
+            channel = channels[node["name"]]
+            while not self.stop.is_set() or not channel.empty():
+                try:
+                    txid, raw = channel.get(timeout=.1)
+                except queue.Empty:
+                    continue
+                with lock:
+                    active = txid in current
+                if not active:
+                    with lock:
+                        status[node["name"]]["pending"].discard(txid)
+                    channel.task_done()
+                    continue
+                started = time.perf_counter_ns()
+                dispatch = now_ms()
+                try:
+                    result = rpc.call("sendrawtransaction", [raw])
+                    label, detail = ("accepted", None) if result == txid else (
+                        "error", f"sendrawtransaction returned {result!r}, not {txid}")
+                except (OSError, ValueError, RPCError) as error:
+                    label, detail = outcome(error=error)
+                with lock:
+                    state = status[node["name"]]
+                    state["pending"].discard(txid)
+                    if label == "accepted" and txid in current:
+                        state["accepted"].add(txid)
+                self.sink.record({"event": "mempool_relay", "txid": txid,
+                                  "target": node["name"], "dispatch_unix_ms": dispatch,
+                                  "observed_at_unix_ms": now_ms(), "outcome": label,
+                                  "error": detail,
+                                  "latency_ms": (time.perf_counter_ns() - started) / 1_000_000})
+                channel.task_done()
+
+        workers = [threading.Thread(target=sender, args=(node,), name=f"mirror-{node['name']}")
+                   for node in nodes]
+        for worker in workers:
+            worker.start()
+        raws = {}
+        try:
+            while not self.stop.is_set():
+                try:
+                    pool = set(self.feeder.call("getrawmempool"))
+                    for txid in sorted(new_txids(raws, pool)):
+                        try:
+                            raws[txid] = self.feeder.call("getrawtransaction", [txid, 0])
+                        except (OSError, ValueError, RPCError) as error:
+                            for node in nodes:
+                                self.sink.record({"event": "mempool_relay", "txid": txid,
+                                                  "target": node["name"],
+                                                  "observed_at_unix_ms": now_ms(),
+                                                  "outcome": "error",
+                                                  "error": f"source fetch: {error}",
+                                                  "latency_ms": None})
+                    for txid in raws.keys() - pool:
+                        del raws[txid]
+                    with lock:
+                        current = pool
+                        for node in nodes:
+                            label = node["name"]
+                            state = status[label]
+                            state["accepted"].intersection_update(pool)
+                            state["pending"].intersection_update(pool)
+                            for txid, raw in raws.items():
+                                if txid in state["accepted"] or txid in state["pending"]:
+                                    continue
+                                try:
+                                    channels[label].put_nowait((txid, raw))
+                                    state["pending"].add(txid)
+                                except queue.Full:
+                                    self.sink.record({"event": "mempool_relay", "txid": txid,
+                                                      "target": label, "observed_at_unix_ms": now_ms(),
+                                                      "outcome": "error", "error": "sender queue full",
+                                                      "latency_ms": None})
+                except (OSError, ValueError, RPCError) as error:
+                    self.diagnostic("feeder mempool", error)
+                self.stop.wait(self.config["mempool_poll_seconds"])
+        finally:
+            for worker in workers:
+                worker.join()
 
     def sampler(self, node):
         rpc = RPC(node, self.config["rpc_timeout_seconds"])
@@ -360,6 +616,8 @@ class Dispatcher:
         last_poll = None
         failed = True
         try:
+            if self.config.get("mirror_mempool"):
+                self.spawn(self.mirror, {"name": "feeder"})
             for node in self.config["contestants"]:
                 self.spawn(self.contestant, node)
                 self.spawn(self.sampler, node)

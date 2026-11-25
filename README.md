@@ -2,7 +2,7 @@
 
 Source-only harness for the published Zebra mining and performance measurements. The code reproduces workloads and analysis, not the original machine, randomized fixture bytes or live arrivals. No binaries, node databases, wallet data or historical run directories are included.
 
-The measurements are distinct: Regtest mining paths; RPC and full-verification replay against Mainnet snapshots; checkpoint sync from local peers; live-network block submission; and Mainnet storage pruning. Regtest loopback results do not measure Internet propagation, orphan rates or fee revenue.
+The measurements are distinct: Regtest mining paths; RPC and full-verification replay against Mainnet snapshots; checkpoint sync from local peers; live-network block submission with optional mempool mirroring; and Mainnet storage pruning. Regtest loopback results do not measure Internet propagation, orphan rates or fee revenue.
 
 | Directory | Purpose |
 |---|---|
@@ -309,24 +309,47 @@ Use a compatible format-30 pruning binary and record its actual full source comm
 
 ## Live comparison
 
-The included dashboard is the current plain view, not the historical controlled-statistics implementation. A new live run can exercise concurrent submission, but cannot recreate historical arrivals or the published 286-block selection and confidence intervals.
+The included dashboard is the current plain view, not the historical controlled-statistics implementation. A new live run cannot recreate historical arrivals or the published 286-block selection and confidence intervals. Use **one dedicated machine per contestant, another for the Mainnet feeder, and a separate dispatcher host**, all on a trusted private LAN. Give measured machines identical CPU, memory, storage, OS tuning, limits and initial block hash; record each binary commit and SHA-256. Do not co-locate contestants: CPU/disk contention and loopback versus LAN latency bias comparisons. The dispatcher timestamps each contestant's RPC dispatch and receipt on its **own monotonic clock**, so no cross-host wall-clock subtraction is needed. Nevertheless, host and network contention, feeder arrival and RPC latency still affect the result; keep clocks synchronized for logs and record offsets.
 
-Each node needs independent, already-synced state. Keep P2P enabled only on the feeder; contestants must have no peers and empty mempools. The historical live comparison used archive Zebra states and a pruned Zakura state. A public Zakura bootstrap catalog is available at `https://zakura.valargroup.dev/mainnet-pruned/snapshots.json`; independently syncing is the trust-minimizing alternative. Never run the bootstrap and isolated Zakura configurations against the same database concurrently.
+Each node needs an independent, already-synced, **stopped** compatible state copy. Stop the snapshot source cleanly before copying and check all initial `getbestblockhash` values match (height alone is insufficient). The historical live comparison used archive Zebra states and a pruned Zakura state. A public Zakura bootstrap catalog is available at `https://zakura.valargroup.dev/mainnet-pruned/snapshots.json`; independently syncing is the trust-minimizing alternative. Never run the bootstrap and isolated Zakura configurations against the same database concurrently. In **block-only mode**, contestants must have no peers and empty mempools; only the feeder connects to Mainnet. In **mirror mode**, each contestant connects to exactly one inbound P2P observer from the dispatcher, which mirrors the feeder's transactions over RPC; an empty contestant mempool is *not* a mirror-mode prerequisite.
 
-Copy the examples and replace every `/path/to` placeholder with your own state, authentication and executable identity. Do not publish the edited authentication configuration.
+Copy the examples **onto their respective hosts** and replace every `/path/to` path, `REPLACE_WITH_MAINNET_TRANSPARENT_ADDRESS` miner address and example LAN IP with your own values. The miner address is required for `getblocktemplate`, but this harness does not mine. The Mainnet contestant configs bind P2P and cookie-authenticated RPC on `0.0.0.0`: firewall **both** ports to the dispatcher host only and block contestants' outbound P2P. Allow the feeder normal Mainnet P2P, but firewall its RPC port to the dispatcher only. HTTP cookie auth does not encrypt traffic: use an isolated trusted LAN or SSH tunnels for RPC; copy fresh cookies to the dispatcher over a secure channel after every restart, with mode 0600, and never publish them. Replace `0.0.0.0` with each host's private interface address when possible. The Zakura bootstrap config is for syncing, not for the isolated comparison.
+
+Use the following host placement (IP addresses are **examples**, not defaults):
+
+| Host | Mainnet config | Example address | Role |
+|---|---|---|---|
+| `feeder` | `feeder.toml` | `10.0.0.10` | Connected Mainnet source, not a contestant |
+| `zebra-reference` | `zebra-reference.toml` | `10.0.0.11` | Measured reference |
+| `zebra-candidate` | `zebra-candidate.toml` | `10.0.0.12` | Measured candidate |
+| `zakura` | `zakura.toml` | `10.0.0.13` | Measured Zakura |
+| `dispatcher` | `contestant.toml.example` | separate host | Source polling, mirroring, submission and timing |
+
+On **each node host**, from a checkout of this repository, set `CONFIG` to that host's table entry and `NODE_BINARY` to its compatible **absolute** executable path. Edit the copied config's state, cookie, network binding and miner-address values before starting; each node needs its *own* state and log:
+
+```bash
+E=/srv/live-comparison
+mkdir -p "$E"
+cp "live-comparison/config/mainnet/$CONFIG" "$E/node.toml"
+# Edit "$E/node.toml"; start only after its private Mainnet snapshot is ready.
+"$NODE_BINARY" -c "$E/node.toml" start >"$E/node.log" 2>&1 &
+printf '%s\n' "$!" >"$E/node.pid"
+```
+
+On the **dispatcher host**, copy each fresh cookie securely after its node starts. The following `scp` loop assumes SSH aliases named as in the table; adjust remote cookie paths to match the four edited node configs. The dispatcher config's four cookie paths must match these local files:
 
 ```bash
 E="$BENCH_OUTPUT/live"
-mkdir -p "$E/config"
-cp live-comparison/config/mainnet/*.toml "$E/config/"
+install -m 700 -d "$E/cookies"
+for role in feeder zebra-reference zebra-candidate zakura; do
+  scp "$role:/path/to/live-comparison/mainnet/$role/rpc/.cookie" "$E/cookies/$role.cookie"
+done
+chmod 600 "$E"/cookies/*.cookie
 cp live-comparison/contestant.toml.example "$E/contestant.toml"
 chmod 600 "$E/contestant.toml"
-# Edit the copied configs before starting any node.
-"$BENCH_BINS/zebrad-reference" -c "$E/config/feeder.toml" start >"$E/feeder.log" 2>&1 & feeder_pid=$!
-"$BENCH_BINS/zebrad-reference" -c "$E/config/zebra-reference.toml" start >"$E/reference.log" 2>&1 & reference_pid=$!
-"$BENCH_BINS/zebrad-optimized" -c "$E/config/zebra-candidate.toml" start >"$E/candidate.log" 2>&1 & candidate_pid=$!
-"$BENCH_BINS/zakurad-reference" -c "$E/config/zakura.toml" start >"$E/zakura.log" 2>&1 & zakura_pid=$!
-# After RPC readiness, aligned tips and peer-isolation checks:
+# Edit its LAN URLs, cookie paths, P2P addresses and exact binary versions.
+# Confirm matching initial best-block hashes and RPC readiness; once dispatch
+# starts, verify each contestant has only its single inbound observer peer.
 python3 -B live-comparison/dispatch.py "$E/contestant.toml" \
   --output "$E/records.jsonl" --duration 3600
 python3 -B live-comparison/load_intervals.py "$E/load-intervals.json"
@@ -334,14 +357,18 @@ python3 -B live-comparison/report.py "$E/records.jsonl" --output "$E/site/report
 python3 -B live-comparison/dashboard.py "$E/records.jsonl" "$E/site" \
   --network Mainnet --config "$E/contestant.toml" --load-intervals "$E/load-intervals.json"
 cp "$E/site/dashboard.html" "$E/site/index.html"
-kill -TERM "$feeder_pid" "$reference_pid" "$candidate_pid" "$zakura_pid"
-wait "$feeder_pid" "$reference_pid" "$candidate_pid" "$zakura_pid"
 python3 -m http.server 8000 --bind 127.0.0.1 --directory "$E/site"
 ```
 
+Stop each node on **its own host** with `kill -TERM "$(< /srv/live-comparison/node.pid)"` and wait for a clean shutdown before copying its state. Never reuse a live database. Do not configure `pid` in the dispatcher TOML for remote processes; `/proc` sampling is local-only.
+
 The interval helper writes `[]` without input. Supply `--input intervals.json` to validate and merge closed Unix-millisecond pairs such as `[[1700000000000,1700000030000]]` for periods when other work ran on the host. The dashboard shades them, marks each latest block busy or quiet, and reports "quiet host" medians and speed-ups from blocks outside them (with 30 s padding). An interval file covers only blocks dispatched before it was written; later blocks, or all blocks when no file is given, show as unknown and never count as quiet. This is simpler than the historical controlled exclusion filter.
 
-The defaults match the retained experiment: polling every 0.02 s, 10 s RPC timeout, resource samples every 30 s, 5 s template timeout and 2 s pause threshold. The dispatcher appends records and runs indefinitely unless a duration is given. Serve the generated dashboard at `/` and detailed reports at `/reports-mainnet/`; explicitly rerun generation to refresh them. For Testnet, use its separate configuration examples, databases and records, set `--network Testnet`, and publish its dashboard as `testnet.html`.
+The example enables `mirror_mempool = true`: the dispatcher polls the feeder mempool every `mempool_poll_seconds` (0.25 s in the example), mirrors new transactions to the contestants, and opens one passive P2P observer per contestant to watch block announcements/bodies alongside `submitblock`, best-tip and template milestones. A measured block's latencies are taken from the dispatcher's **single monotonic clock**, relative to that contestant's own submission start. Immediately before each live block, it also takes **ten `getblockcount` round trips per contestant and records their median** as an RPC/network baseline; do not treat that baseline as a precise per-block network correction. Inspect missing observations, rejected submissions, feeder polling errors, catch-up blocks and mirror admission failures rather than treating them as fast measurements. For the original block-only comparison, set `mirror_mempool = false`, remove the `p2p` entries and keep contestant mempools empty and peers absent.
+
+Mainnet `getblocktemplate` may be gated by node sync-status heuristics even when a disconnected node has the correct tip. The observer's same-tip responses may allow it, but verify template readiness, matching tips and the sole inbound peer on **each actual Mainnet build**; a local Regtest smoke check cannot establish that this works on Mainnet. No new Mainnet latency claim follows from this harness until a real run produces complete, matched records.
+
+The remaining defaults match the retained experiment: block polling every 0.02 s, 10 s RPC timeout, resource samples every 30 s, 5 s template timeout and 2 s pause threshold. The dispatcher appends records and runs indefinitely unless a duration is given. Serve the generated dashboard at `/` and detailed reports at `/reports-mainnet/`; explicitly rerun generation to refresh them. For Testnet, use its separate configuration examples, databases and records, set `--network Testnet`, and publish its dashboard as `testnet.html`.
 
 ## Offline checks
 

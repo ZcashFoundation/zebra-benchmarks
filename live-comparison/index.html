@@ -22,9 +22,11 @@
 <header>
   <h1>Live block comparison</h1>
   <p>Same-block <code>submitblock</code> RPC round trips, not consensus-only timings.
-    A positive right-minus-left median means the right target was slower.</p>
+    The mean includes slow rounds; medians and half-sample modes describe the typical latency.
+    A positive right-minus-left difference means the right target was slower.</p>
   <p>Catch-up and ineligible attempts do not enter latency comparisons. Five minutes often yields fewer
-    than 20 pairs; an absent interval is not evidence of equality. See coverage and errors before comparing.</p>
+    than 20 pairs; an absent 95% paired-mean bootstrap interval is not evidence of equality. Intervals
+    resample occupied five-minute clusters. See coverage and errors before comparing.</p>
   <button id="refresh" type="button">Refresh reports</button>
   <p id="status" role="status">Loading reports…</p>
   <noscript><p>JavaScript is needed for the tables. Read <a href="index.json">index.json</a>
@@ -68,9 +70,10 @@ function details(parent, title, data) {
 }
 function pairRows(pairs) {
   return pairs.map(pair => [pair.left, pair.right, number(pair.eligible_pairs),
-    number(pair.paired_right_minus_left_ms),
+    number(pair.paired_mean_right_minus_left_ms),
     pair.interval?.lower_ms != null && pair.interval?.upper_ms != null
       ? `${number(pair.interval.lower_ms)} to ${number(pair.interval.upper_ms)}` : 'not available',
+    number(pair.paired_median_right_minus_left_ms),
     number(pair.interval?.clusters), pair.evidence, compact(pair.exclusions)]);
 }
 function render(section, report, url) {
@@ -88,11 +91,12 @@ function render(section, report, url) {
     `Minimum pairs: ${number(report.minimum_descriptive_pairs)}; ` +
     `maximum dispatch skew: ${number(report.max_dispatch_skew_ms)} ms.`, section);
   table(section, 'Paired latency differences (ms)',
-    ['Left', 'Right', 'Pairs', 'Median right − left', '95% bootstrap interval', 'Clusters', 'Evidence', 'Exclusions'],
+    ['Left', 'Right', 'Pairs', 'Mean right − left', 'Mean bootstrap 95% CI', 'Median right − left', 'Clusters', 'Evidence', 'Exclusions'],
     pairRows(report.selection.pairs));
-  table(section, 'Latency on the all-target common subset (ms)', ['Target', 'n', 'Median', 'p95', 'p99'],
+  table(section, 'Latency on the all-target common subset (ms)', ['Target', 'n', 'Mean', 'Median', 'Half-sample mode', 'p95', 'p99'],
     Object.entries(report.selection.common_subset).map(([target, sample]) =>
-      [target, number(sample.n), number(sample.median_ms), number(sample.p95_ms), number(sample.p99_ms)]));
+      [target, number(sample.n), number(sample.mean_ms), number(sample.median_ms), number(sample.mode_ms),
+        number(sample.p95_ms), number(sample.p99_ms)]));
   table(section, 'Coverage (all attempts, including catch-up)',
     ['Target', 'Observed blocks', 'Missing blocks', 'Catch-up attempts', 'Outcomes'],
     Object.entries(report.coverage).map(([target, sample]) => [target, number(sample.blocks_observed),
@@ -102,7 +106,8 @@ function render(section, report, url) {
   element('p', 'Thresholds are a documented local policy inferred from public examples, not verified upstream boundaries.', categories);
   if (report.taxonomy_thresholds) details(categories, 'Local taxonomy thresholds', report.taxonomy_thresholds);
   table(categories, 'Category pair comparisons (ms)',
-    ['Category', 'Blocks', 'Left', 'Right', 'Pairs', 'Median right − left', '95% bootstrap interval', 'Clusters', 'Evidence', 'Exclusions'],
+    ['Category', 'Blocks', 'Left', 'Right', 'Pairs', 'Mean right − left', 'Mean bootstrap 95% CI',
+      'Median right − left', 'Clusters', 'Evidence', 'Exclusions'],
     Object.entries(report.categories || {}).flatMap(([tag, group]) =>
       pairRows(group.pairs || []).map(row => [tag, number(group.blocks), ...row])));
   const observations = report.observations || [];
