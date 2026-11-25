@@ -21,7 +21,8 @@ MIN_PAIRS = 20
 MIN_CLUSTERS = 12
 BOOTSTRAP_SAMPLES = 2000
 OUTCOMES = ("accepted", "duplicate", "rejected", "error", "timeout")
-EVENTS = ("submitblock_call", "getblocktemplate", "resource_interval", "session")
+EVENTS = ("submitblock_call", "submit_paths", "mempool_relay", "getblocktemplate", "resource_interval", "session")
+MILESTONES = ("rpc_round_trip_ms", "submit_return_ms", "tip_ms", "template_ms", "peer_told_ms", "peer_has_ms")
 
 
 def encoded(value):
@@ -48,6 +49,8 @@ def validate(record):
     if event not in EVENTS:
         return
     times = {"submitblock_call": ("queued_unix_ms", "dispatch_unix_ms", "observed_at_unix_ms"),
+             "submit_paths": ("queued_unix_ms", "dispatch_unix_ms", "observed_at_unix_ms"),
+             "mempool_relay": ("observed_at_unix_ms",),
              "getblocktemplate": ("at_unix_ms",), "resource_interval": ("start_unix_ms", "end_unix_ms"),
              "session": ("at_unix_ms",)}[event]
     for key in times:
@@ -62,6 +65,39 @@ def validate(record):
         return
     if not isinstance(record.get("target"), str) or not record["target"]:
         raise ValueError(f"{event}: target must be a nonempty string")
+    if event == "mempool_relay":
+        txid = record.get("txid")
+        if not isinstance(txid, str) or len(txid) != 64 or any(c not in "0123456789abcdef" for c in txid):
+            raise ValueError("mempool_relay: txid must be lowercase 32-byte hex")
+        if (record.get("outcome") not in OUTCOMES or "error" not in record
+                or record["error"] is not None and not isinstance(record["error"], str)):
+            raise ValueError("mempool_relay: invalid outcome or error")
+        if record.get("dispatch_unix_ms") is not None:
+            if type(record["dispatch_unix_ms"]) is not int or record["dispatch_unix_ms"] < 0:
+                raise ValueError("mempool_relay: invalid dispatch_unix_ms")
+            if record["dispatch_unix_ms"] > record["observed_at_unix_ms"]:
+                raise ValueError("mempool_relay: response precedes dispatch")
+        if "latency_ms" not in record or record["latency_ms"] is not None and not finite(record["latency_ms"]):
+            raise ValueError("mempool_relay: invalid latency_ms")
+        return
+    if event == "submit_paths":
+        if any(not isinstance(record.get(k), str) for k in ("client", "version")):
+            raise ValueError("submit_paths requires client and version strings")
+        block_hash = record.get("hash")
+        if not isinstance(block_hash, str) or len(block_hash) != 64 or any(c not in "0123456789abcdef" for c in block_hash):
+            raise ValueError("submit_paths: hash must be lowercase 32-byte hex")
+        if any(type(record.get(k)) is not int or record[k] < 0 for k in ("height", "block_bytes")):
+            raise ValueError("submit_paths: invalid height or block_bytes")
+        if record["observed_at_unix_ms"] < record["dispatch_unix_ms"]:
+            raise ValueError("submit_paths: response precedes dispatch")
+        if record.get("outcome") not in OUTCOMES or type(record.get("catch_up")) is not bool:
+            raise ValueError("submit_paths: invalid outcome or catch_up")
+        if record.get("detail") is not None and not isinstance(record["detail"], str):
+            raise ValueError("submit_paths: invalid detail")
+        for key in MILESTONES:
+            if key not in record or record[key] is not None and not finite(record[key]):
+                raise ValueError(f"submit_paths: invalid {key}")
+        return
     if event == "submitblock_call":
         if any(not isinstance(record.get(k), str) for k in ("client", "version")):
             raise ValueError("submitblock_call requires client and version strings")
@@ -110,7 +146,7 @@ def prepare(records):
     for record in records:
         validate(record)
         advertised = record.get("clients", {}) if record.get("event") == "session" else {}
-        if record.get("event") == "submitblock_call":
+        if record.get("event") in ("submitblock_call", "submit_paths"):
             advertised = {record["target"]: {"name": record["client"], "version": record["version"]}}
         for target, client in advertised.items():
             identity = (client["name"], client["version"])
@@ -145,8 +181,13 @@ def prepare(records):
     # Windows scan these, not every record: diagnostics dominate long logs.
     sessions = [r for r in records if r.get("event") == "session"]
     telemetry = [r for r in records if r.get("event") in ("getblocktemplate", "resource_interval")]
+    paths = {}
+    for record in sorted((r for r in records if r.get("event") == "submit_paths"),
+                         key=lambda r: (r["dispatch_unix_ms"], r["observed_at_unix_ms"])):
+        paths.setdefault((record["hash"], record["target"]), record)
+    relays = [r for r in records if r.get("event") == "mempool_relay"]
     return {"records": records, "blocks": blocks, "analysis_sha256": analysis,
-            "sessions": sessions, "telemetry": telemetry}
+            "sessions": sessions, "telemetry": telemetry, "paths": paths, "relays": relays}
 
 
 def percentile(ordered, fraction):
@@ -242,6 +283,18 @@ def summarize(model, start, end):
     for attempt in attempts:
         clients.setdefault(attempt["target"], {"name": attempt.get("client"), "version": attempt.get("version")})
     telemetry = [r for r in model["telemetry"] if start <= record_time(r) < end]
+    paths = model["paths"]
+    for block in blocks:
+        for target, attempt in block["first"].items():
+            path = paths.get((block["feature"]["hash"], target))
+            if (path is None or path["dispatch_unix_ms"] != attempt["dispatch_unix_ms"]
+                    or path["height"] != attempt["height"] or path["block_bytes"] != attempt["block_bytes"]
+                    or path["outcome"] != attempt["outcome"] or path["catch_up"]):
+                continue
+            clients.setdefault(target, {"name": path["client"], "version": path["version"]})
+    relays = [r for r in model["relays"] if start <= record_time(r) < end]
+    for record in relays:
+        clients.setdefault(record["target"], {"name": None, "version": None})
     for record in telemetry:
         clients.setdefault(record["target"], {"name": None, "version": None})
     targets = sorted(clients)
@@ -268,6 +321,38 @@ def summarize(model, start, end):
         else:
             samples.append({"at_unix_ms": record["at_unix_ms"], "status": "unknown",
                             "getblocktemplate": {record["target"]: stripped}})
+    def milestone(block, target, key):
+        first = block["first"].get(target)
+        path = paths.get((block["feature"]["hash"], target))
+        if (first is None or path is None or first["dispatch_unix_ms"] != path["dispatch_unix_ms"]
+                or first["height"] != path["height"] or first["block_bytes"] != path["block_bytes"]
+                or first["outcome"] != path["outcome"] or path["catch_up"]):
+            return None
+        return path[key]
+
+    milestones = {}
+    for key in MILESTONES:
+        contestants = {target: latency([value for block in blocks if not exclusion(block, (target,))
+                                         if (value := milestone(block, target, key)) is not None])
+                       for target in targets}
+        comparisons = []
+        for left, right in itertools.combinations(targets, 2):
+            paired_samples = [(block["at"], r - l) for block in blocks if not exclusion(block, (left, right))
+                              if (l := milestone(block, left, key)) is not None
+                              if (r := milestone(block, right, key)) is not None]
+            differences = [delta for _, delta in paired_samples]
+            evidence, confidence = interval(paired_samples)
+            comparisons.append({"left": left, "right": right, "eligible_pairs": len(paired_samples),
+                                "paired_mean_right_minus_left_ms": statistics.fmean(differences) if differences else None,
+                                "paired_median_right_minus_left_ms": statistics.median(differences) if differences else None,
+                                "evidence": evidence, "interval": confidence})
+        milestones[key] = {"contestants": contestants, "pairs": comparisons}
+    relay_acceptance = {}
+    for target in targets:
+        own = [r for r in relays if r["target"] == target]
+        accepted = sum(r["outcome"] == "accepted" for r in own)
+        relay_acceptance[target] = {"attempts": len(own), "accepted": accepted,
+                                    "acceptance_rate": accepted / len(own) if own else None}
     result = {"schema_version": 1, "taxonomy_version": "zcash-workloads-v1",
               "taxonomy_thresholds": THRESHOLDS, "mode": "live_fed",
               "synthetic": any(s["synthetic"] for s in sessions) if sessions else None,
@@ -277,13 +362,16 @@ def summarize(model, start, end):
               "bootstrap": {"cluster_ms": WINDOW_MS, "minimum_clusters": MIN_CLUSTERS,
                             "resamples": BOOTSTRAP_SAMPLES, "seed": 0, "confidence": .95},
               "clients": {t: clients[t] for t in targets}, "coverage": coverage,
-              "selection": selection(blocks, targets),
+              "selection": selection(blocks, targets), "submit_paths": {"milestones": milestones},
+              "mempool_relay": relay_acceptance,
               "categories": {tag: selection(group, targets) for tag, group in sorted(categories.items())},
               "features": [b["feature"] for b in blocks],
               "observations": [{k: v for k, v in a.items() if k not in ("raw_block_hex", "event")} for a in attempts],
               "synchronization": {"counts": {"agreement": 0, "disagreement": 0, "unknown": len(samples)},
                                   "samples": samples, "resource_intervals": resources}}
-    result["inputs_sha256"] = {"records": digest(attempts + telemetry + sessions)}
+    selected_paths = [paths[(b["feature"]["hash"], target)] for b in blocks for target in b["first"]
+                      if (b["feature"]["hash"], target) in paths]
+    result["inputs_sha256"] = {"records": digest(attempts + telemetry + sessions + selected_paths + relays)}
     result["analysis_sha256"] = model["analysis_sha256"]
     result["report_id"] = digest(result)
     return result

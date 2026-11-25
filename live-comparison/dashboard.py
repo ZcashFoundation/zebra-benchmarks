@@ -12,7 +12,7 @@ import statistics
 import sys
 import tomllib
 
-from latency_stats import paired, summary
+from latency_stats import summary
 import report
 from load_intervals import merge_intervals
 
@@ -49,18 +49,21 @@ def latency_summary(blocks, target):
 
 
 def glance_comparisons(blocks):
-    """Same-block comparator / candidate ratios and signed paired savings."""
+    """Ratio of paired means and signed same-block savings, clustered by dispatch time."""
     comparisons = {}
     for target in (TARGETS[1], TARGETS[0]):
         pairs = [(b["first"][target]["latency_ms"], b["first"][TARGETS[2]]["latency_ms"])
                  for b in blocks]
-        ratios = [a / b for a, b in pairs if b != 0]
-        differences = [a - b for a, b in pairs]
-        stats = paired(differences, resamples=report.BOOTSTRAP_SAMPLES) if differences else None
-        comparisons[target] = {"ratio": statistics.fmean(ratios) if ratios else None, "n": len(ratios),
-                               "saving_ms": stats["mean"] if stats else None,
-                               "saving_ci95_ms": stats["mean_ci95"] if stats else None,
-                               "saving_median_ms": stats["median"] if stats else None,
+        candidate_total = sum(candidate for _, candidate in pairs)
+        differences = [comparator - candidate for comparator, candidate in pairs]
+        _, confidence = report.interval([(b["at"], difference) for b, difference in zip(blocks, differences)])
+        comparisons[target] = {"ratio": sum(comparator for comparator, _ in pairs) / candidate_total
+                               if candidate_total else None,
+                               "n": len(pairs) if candidate_total else 0,
+                               "saving_ms": statistics.fmean(differences) if differences else None,
+                               "saving_ci95_ms": [confidence["lower_ms"], confidence["upper_ms"]]
+                               if confidence["lower_ms"] is not None else None,
+                               "saving_median_ms": statistics.median(differences) if differences else None,
                                "saving_n": len(pairs)}
     return comparisons
 
@@ -299,7 +302,7 @@ def render(data):
 <header><div class="page-heading"><h1>Zebra perf stats</h1><nav class="network-tabs" aria-label="Network">{navigation}</nav></div>
 <p class="note">{"SYNTHETIC DATA — not real measurements · " if data["synthetic"] else ""}Updated {data["generated_at"]}</p></header>
 <section aria-labelledby="glance"><h2 id="glance">Block submission latency</h2>
-<p>Each new {network} block is submitted to all three nodes concurrently via <code>submitblock</code>. Latency is the RPC round trip of each node's first attempt. Mean latency and mean same-block speed-ups and savings are headlines (slow rounds matter); medians and half-sample modes show their effect. Speed-up ratios omit blocks with zero Optimized Zebra latency, but paired savings include them. Savings are comparator minus Optimized Zebra; bootstrap 95% intervals resample paired blocks. Figures cover the last 24 hours unless marked otherwise. Quiet-host figures use only blocks dispatched outside recorded host-load intervals (±30 s).</p>
+<p>Each new {network} block is submitted to all three nodes concurrently via <code>submitblock</code>. Latency is the RPC round trip of each node's first attempt. Mean latency and the ratio of paired means (comparator ÷ Optimized Zebra) and paired mean savings are headlines (slow rounds matter); medians and half-sample modes show their effect. Savings are comparator minus Optimized Zebra. Bootstrap 95% intervals resample occupied five-minute dispatch clusters and are unavailable below {report.MIN_PAIRS} pairs or {report.MIN_CLUSTERS} clusters. Figures cover the last 24 hours unless marked otherwise. Quiet-host figures use only blocks dispatched outside recorded host-load intervals (±30 s).</p>
 <div class="glance-headlines">{"".join(headline_rows)}</div>
 <div class="glance-tiles">{"".join(tiles)}</div>
 <h3>Latency, last 24 h</h3>
@@ -309,7 +312,7 @@ def render(data):
 <figure><div id="size-chart" class="chart" role="img" aria-label="Submission latency by block size"></div><figcaption>Latency against serialized block size for every block accepted by all three nodes, all records.</figcaption></figure>
 <div class="table-wrap" tabindex="0" role="region" aria-label="Latest blocks"><table><caption>Latest 10 blocks (ms)</caption><thead><tr><th scope="col">Height</th><th scope="col">kB</th>{heads}<th scope="col">Host</th></tr></thead><tbody>{"".join(recent_rows) or '<tr><td colspan="6">No blocks yet.</td></tr>'}</tbody></table></div></section>
 <section aria-labelledby="how"><h2 id="how">Method</h2>
-<p>A Zebra feeder follows {network} over P2P and dispatches each new block to the three nodes. The nodes run without peers and with empty mempools, so latency is dominated by block validation and commit. All four nodes share one host with other workloads; recorded host load is shaded and excluded from the quiet-host figures.</p>
+<p>A Zebra feeder follows {network} over P2P and dispatches each new block to the three nodes. Depending on dispatcher configuration, feeder mempool transactions may also be mirrored; this page does not separate that traffic. All four nodes share one host with other workloads; recorded host load is shaded and excluded from the quiet-host figures.</p>
 <div class="table-wrap" tabindex="0" role="region" aria-label="Builds"><table><caption>Builds</caption><thead><tr><th scope="col">Node</th><th scope="col">Build</th><th scope="col">Storage</th></tr></thead><tbody>{build_rows}</tbody></table></div>
 <button id="download-csv" type="button">Download per-block CSV</button></section>
 ''').replace("@@DATA@@", payload)

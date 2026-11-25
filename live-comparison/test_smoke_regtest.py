@@ -1,5 +1,7 @@
 """Offline assertions for the sealed live-Regtest smoke contract."""
 
+from contextlib import redirect_stderr
+from io import StringIO
 from types import SimpleNamespace
 import unittest
 
@@ -16,9 +18,18 @@ class SmokeAssertions(unittest.TestCase):
         self.assertEqual(config["network"], "regtest")
         self.assertIs(config["synthetic"], True)
         self.assertIs(config["mirror_mempool"], True)
+        self.assertIs(config["measure_submit_paths"], True)
         self.assertEqual(config["feeder"]["url"], "http://127.0.0.1:10001/")
         self.assertEqual(config["contestants"][0]["p2p"], node.p2p_addr)
         self.assertEqual(config["contestants"][0]["pid"], 42)
+
+    def test_fixture_directory_is_required_before_starting_nodes(self):
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as exit:
+            smoke.main(["--feeder", "/missing", "--contestant", "reference=/missing",
+                        "--candidate", "mixed-1900000", "--output", "/missing"])
+        self.assertEqual(exit.exception.code, 2)
+        self.assertIn("--fixture-dir", errors.getvalue())
 
     def test_candidate_acceptance_and_all_five_milestones_are_required(self):
         fixture = {"hash": "ab", "height": 311, "raw": "0a"}

@@ -11,6 +11,7 @@ sample_interval_seconds = 30
 template_timeout_seconds = 5
 pause_threshold_seconds = 2
 mirror_mempool = true
+measure_submit_paths = true
 mempool_poll_seconds = 0.25
 network = "mainnet"
 

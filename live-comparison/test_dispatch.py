@@ -42,12 +42,17 @@ def make_chain(count):
 
 
 class FakeNode:
-    def __init__(self, chain, height=0, behavior=None, delay=0, auth=None):
+    def __init__(self, chain, height=0, behavior=None, delay=0, auth=None,
+                 txs=None, pool=None, tx_behavior=None):
         self.chain = chain
         self.height = height
         self.behavior = behavior or {}
         self.delay = delay
         self.auth = auth
+        self.txs = txs or {}
+        self.pool = set(pool or ())
+        self.tx_behavior = tx_behavior or {}
+        self.tx_attempts = []
         self.attempts = []
         self.calls = []
         self.lock = threading.Lock()
@@ -108,6 +113,32 @@ class FakeNode:
             block = next(block for block in self.chain if block["hash"] == params[0])
             return block["raw"] if method == "getblock" else {
                 key: value for key, value in block.items() if key != "raw"}
+        if method == "getrawmempool":
+            return ({txid: {"depends": self.txs[txid]["depends"]} for txid in self.txs
+                     if txid in self.pool} if params and params[0] else list(self.pool))
+        if method == "getrawtransaction":
+            txid = params[0]
+            if txid not in self.pool:
+                raise dispatch.RPCError({"code": -5, "message": "transaction not in mempool"})
+            return self.txs[txid]["raw"]
+        if method == "sendrawtransaction":
+            raw = params[0]
+            txid = next((key for key, info in self.txs.items() if info["raw"] == raw), None)
+            if txid is None:
+                raise dispatch.RPCError({"code": -22, "message": "unknown transaction"})
+            with self.lock:
+                self.tx_attempts.append(txid)
+            behavior = self.tx_behavior.get(txid)
+            if behavior == "reject":
+                raise dispatch.RPCError({"code": -26, "message": "policy rejection"})
+            if behavior == "duplicate_chain":
+                raise dispatch.RPCError({"code": -27, "message": "already in chain"})
+            if txid in self.pool or behavior == "duplicate_mempool":
+                raise dispatch.RPCError({"code": -1, "message": "transaction already exists in mempool"})
+            if not set(self.txs[txid]["depends"]) <= self.pool:
+                raise dispatch.RPCError({"code": -25, "message": "missing mempool parent"})
+            self.pool.add(txid)
+            return txid
         if method == "getblocktemplate":
             return {"height": self.height + 1, "transactions": []}
         if method == "submitblock":
@@ -140,7 +171,7 @@ def config_for(feeder, nodes):
          "pid": os.getpid()} for i, node in enumerate(nodes)],
         "poll_interval_seconds": .02, "rpc_timeout_seconds": .1,
         "sample_interval_seconds": .05, "template_timeout_seconds": .1,
-        "pause_threshold_seconds": 2, "synthetic": True}
+        "pause_threshold_seconds": 2, "synthetic": True, "network": "mainnet"}
 
 
 def eventually(predicate, timeout=4):
@@ -243,6 +274,113 @@ class DispatchTests(unittest.TestCase):
                          [12, 9, 11, 13])
         self.assertIsNone(row["template_ms"])
 
+    def test_parent_first_orders_dependencies_and_rejects_cycles(self):
+        parent, child = "f" * 64, "a" * 64
+        self.assertEqual(dispatch.parent_first({child: {"depends": [parent]},
+                                                parent: {"depends": []}}), [parent, child])
+        with self.assertRaisesRegex(ValueError, "cyclic"):
+            dispatch.parent_first({child: {"depends": [parent]},
+                                   parent: {"depends": [child]}})
+
+    def test_mirror_deduplicates_and_retries_only_after_departure_or_tip_change(self):
+        chain = make_chain(2)
+        parent, child, flaky = ("f" * 64, "a" * 64, "b" * 64)
+        txs = {child: {"raw": "01", "depends": [parent]},
+               flaky: {"raw": "02", "depends": []},
+               parent: {"raw": "03", "depends": []}}
+        with ExitStack() as stack:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            feeder = stack.enter_context(FakeNode(chain, txs=txs, pool=txs))
+            one = stack.enter_context(FakeNode(chain, txs=txs))
+            two = stack.enter_context(FakeNode(chain, txs=txs, pool=[parent],
+                                               tx_behavior={child: "reject", flaky: "reject"}))
+            config = config_for(feeder, [one, two])
+            config.update(mirror_mempool=True, mempool_poll_seconds=.02)
+            path = directory / "records.jsonl"
+
+            def rows(name, txid):
+                return [row for row in read_records(path)
+                        if row.get("event") == "mempool_relay"
+                        and row["target"] == name and row["txid"] == txid]
+
+            with RunningDispatcher(config, path):
+                eventually(lambda: len(one.tx_attempts) == 3 and len(two.tx_attempts) == 3)
+                self.assertLess(one.tx_attempts.index(parent), one.tx_attempts.index(child))
+                self.assertLess(two.tx_attempts.index(parent), two.tx_attempts.index(child))
+                eventually(lambda: len(rows("node-0", child)) == 1 and
+                           len(rows("node-1", child)) == 1)
+                self.assertEqual(rows("node-1", parent)[0]["outcome"], "accepted")
+                self.assertEqual(rows("node-1", child)[0]["outcome"], "rejected")
+                time.sleep(.15)
+                self.assertEqual(two.tx_attempts.count(child), 1)
+                self.assertEqual(two.tx_attempts.count(flaky), 1)
+                feeder.pool.remove(child)
+                time.sleep(.1)
+                two.tx_behavior.pop(child)
+                feeder.pool.add(child)
+                eventually(lambda: len(rows("node-1", child)) == 2)
+                self.assertEqual(rows("node-1", child)[1]["outcome"], "accepted")
+                two.tx_behavior.pop(flaky)
+                feeder.height = 1
+                eventually(lambda: len(rows("node-1", flaky)) == 2)
+                self.assertEqual(rows("node-1", flaky)[1]["outcome"], "accepted")
+
+    def test_submit_path_instrumentation_off_and_observers_never_gate_submit(self):
+        chain = make_chain(2)
+        with ExitStack() as stack:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            feeder = stack.enter_context(FakeNode(chain))
+            node = stack.enter_context(FakeNode(chain))
+            config = config_for(feeder, [node])
+            config["contestants"][0]["p2p"] = "127.0.0.1:1"
+            path = directory / "records.jsonl"
+            with RunningDispatcher(config, path):
+                feeder.height = 1
+                eventually(lambda: node.height == 1)
+            self.assertFalse(any(row["event"] == "submit_paths" for row in read_records(path)))
+            self.assertFalse(any(method == "getblockcount" for method, _ in node.calls))
+            self.assertFalse(any(row["event"] == "diagnostic" for row in read_records(path)))
+
+            path = directory / "measured.jsonl"
+            config["measure_submit_paths"] = True
+            feeder.height = 0
+            node.height = 0
+            with RunningDispatcher(config, path):
+                feeder.height = 1
+                eventually(lambda: any(row["event"] == "submit_paths"
+                                       for row in read_records(path)))
+            attempt = next(row for row in read_records(path)
+                           if row["event"] == "submitblock_call" and not row["catch_up"])
+            self.assertLess(attempt["dispatch_delay_ms"], 100)
+            self.assertEqual(attempt["outcome"], "accepted")
+            self.assertTrue(any(method == "getblockcount" for method, _ in node.calls))
+
+    def test_tip_deadline_starts_when_submit_returns(self):
+        chain = make_chain(1)
+        with tempfile.TemporaryDirectory() as directory, FakeNode(chain) as node:
+            config = config_for(node, [node])
+            config["template_timeout_seconds"] = .05
+            dispatcher = dispatch.Dispatcher(config, Path(directory) / "records.jsonl")
+            started, finished = threading.Event(), threading.Event()
+            observed, errors = {}, []
+            watcher = threading.Thread(target=dispatcher.tip_watch,
+                                       args=({"url": node.url}, "ff" * 32, started, finished,
+                                             observed, errors))
+            try:
+                watcher.start()
+                started.set()
+                time.sleep(.1)
+                self.assertTrue(watcher.is_alive())
+                observed["returned_ns"] = time.perf_counter_ns()
+                finished.set()
+                watcher.join(.5)
+                self.assertFalse(watcher.is_alive())
+                self.assertIn("tip poll: timed out", errors)
+            finally:
+                dispatcher.stop.set()
+                finished.set()
+                watcher.join(.5)
+                dispatcher.sink.close()
 
     def test_concurrent_dispatch_and_samples(self):
         chain = make_chain(3)
@@ -361,6 +499,7 @@ class DispatchTests(unittest.TestCase):
             config["contestants"][0]["url"] += "/other"
             path.write_text(json.dumps(config))
             self.assertEqual(dispatch.load_config(path)["poll_interval_seconds"], .02)
+            self.assertIs(dispatch.load_config(path)["measure_submit_paths"], False)
             path = root / "config.toml"
             path.write_text('[feeder]\nurl = "http://127.0.0.1:1"\n'
                             '[[contestants]]\nname = "a"\nclient = "Zebra"\nversion = "test"\n'
@@ -391,6 +530,7 @@ class DispatchTests(unittest.TestCase):
                     else:
                         self.assertEqual(endpoint["url"], f'http://{rpc["listen_addr"]}')
                         self.assertEqual(Path(endpoint["cookie"]), Path(rpc["cookie_dir"]) / ".cookie")
+                    self.assertNotIn("auth", endpoint)
                     self.assertNotIn("pid", endpoint)  # Operators supply current process IDs.
                     for address in (network["listen_addr"], rpc["listen_addr"]):
                         port = address.rsplit(":", 1)[1]

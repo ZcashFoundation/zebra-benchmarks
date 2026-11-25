@@ -27,6 +27,10 @@
   <p>Catch-up and ineligible attempts do not enter latency comparisons. Five minutes often yields fewer
     than 20 pairs; an absent 95% paired-mean bootstrap interval is not evidence of equality. Intervals
     resample occupied five-minute clusters. See coverage and errors before comparing.</p>
+  <p>Optional submit-path milestones measure elapsed time since dispatch (not independent RPC calls).
+    Matched, first accepted blocks are compared by milestone; missing observer timestamps are omitted, not zero.
+    Mempool mirror acceptance is accepted relay events divided by recorded relay attempts per contestant,
+    not proof of network-wide transaction propagation.</p>
   <button id="refresh" type="button">Refresh reports</button>
   <p id="status" role="status">Loading reports…</p>
   <noscript><p>JavaScript is needed for the tables. Read <a href="index.json">index.json</a>
@@ -101,6 +105,31 @@ function render(section, report, url) {
     ['Target', 'Observed blocks', 'Missing blocks', 'Catch-up attempts', 'Outcomes'],
     Object.entries(report.coverage).map(([target, sample]) => [target, number(sample.blocks_observed),
       number(sample.missing_blocks), number(sample.catch_up_attempts), compact(sample.all_attempt_outcomes)]));
+  const milestones = report.submit_paths?.milestones || {};
+  if (Object.values(milestones).some(group =>
+    Object.values(group.contestants || {}).some(sample => sample.n))) {
+    table(section, 'Submit-path milestones since dispatch (ms)', ['Milestone', 'Target', 'n', 'Mean', 'Median', 'Half-sample mode'],
+      Object.entries(milestones).flatMap(([name, group]) =>
+        Object.entries(group.contestants || {}).map(([target, sample]) =>
+          [name, target, number(sample.n), number(sample.mean_ms), number(sample.median_ms), number(sample.mode_ms)])));
+    table(section, 'Same-block submit-path differences (ms)',
+      ['Milestone', 'Left', 'Right', 'Pairs', 'Mean right − left', 'Mean bootstrap 95% CI',
+        'Median right − left', 'Clusters', 'Evidence'],
+      Object.entries(milestones).flatMap(([name, group]) =>
+        (group.pairs || []).map(pair => [name, pair.left, pair.right, number(pair.eligible_pairs),
+          number(pair.paired_mean_right_minus_left_ms),
+          pair.interval?.lower_ms != null && pair.interval?.upper_ms != null
+            ? `${number(pair.interval.lower_ms)} to ${number(pair.interval.upper_ms)}` : 'not available',
+          number(pair.paired_median_right_minus_left_ms), number(pair.interval?.clusters), pair.evidence])));
+  }
+  const relay = report.mempool_relay || {};
+  if (Object.values(relay).some(sample => sample.attempts)) {
+    table(section, 'Mempool mirror RPC acceptance (recorded relay attempts)',
+      ['Target', 'Attempts', 'Accepted', 'Acceptance rate'],
+      Object.entries(relay).map(([target, sample]) =>
+        [target, number(sample.attempts), number(sample.accepted),
+          sample.acceptance_rate == null ? '—' : `${number(sample.acceptance_rate * 100)}%`]));
+  }
   const categories = element('details', undefined, section);
   element('summary', 'Workload categories (overlapping labels, not additive)', categories);
   element('p', 'Thresholds are a documented local policy inferred from public examples, not verified upstream boundaries.', categories);

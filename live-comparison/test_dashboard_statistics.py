@@ -57,7 +57,7 @@ class DashboardStatisticsTests(unittest.TestCase):
         for node in glance["nodes"].values():
             self.assertEqual(node["n"], 1)
         self.assertEqual(glance["comparisons"]["zebra-reference"],
-                         {"n": 1, "ratio": 2.4, "saving_ms": 7, "saving_ci95_ms": [7, 7],
+                         {"n": 1, "ratio": 2.4, "saving_ms": 7, "saving_ci95_ms": None,
                           "saving_median_ms": 7, "saving_n": 1})
         self.assertIn(
             f'<tr><th scope="row" title="{rows[-1]["hash"]}">1</th>'
@@ -91,12 +91,12 @@ class DashboardStatisticsTests(unittest.TestCase):
             self.assertEqual(glance["nodes"][target],
                              {"n": 3, "mean_ms": median, "median_ms": median, "mode_ms": median})
         self.assertEqual(glance["comparisons"]["zebra-reference"],
-                         {"n": 3, "ratio": 2.4, "saving_ms": 7, "saving_ci95_ms": [7, 7],
+                         {"n": 3, "ratio": 2.4, "saving_ms": 7, "saving_ci95_ms": None,
                           "saving_median_ms": 7, "saving_n": 3})
         zakura = glance["comparisons"]["zakura"]
         self.assertAlmostEqual(zakura["ratio"], .4)
         self.assertEqual({key: value for key, value in zakura.items() if key != "ratio"},
-                         {"n": 3, "saving_ms": -3, "saving_ci95_ms": [-3, -3],
+                         {"n": 3, "saving_ms": -3, "saving_ci95_ms": None,
                           "saving_median_ms": -3, "saving_n": 3})
         self.assertEqual(data["mixed_load"]["All sizes"]["n"], 4)
         html = dashboard.render(data)
@@ -105,7 +105,7 @@ class DashboardStatisticsTests(unittest.TestCase):
         self.assertIn("Saves 7.0 ms per block", html)
         self.assertIn("Adds 3.0 ms per block", html)
 
-    def test_glance_ratios_are_same_block_and_omit_zero_denominators(self):
+    def test_glance_ratio_of_means_includes_zero_candidate_blocks(self):
         helper = test_dispatch.DashboardTests()
         rows = helper.records(4)
         for row in rows[1:]:
@@ -121,18 +121,17 @@ class DashboardStatisticsTests(unittest.TestCase):
             self.assertEqual(glance["nodes"]["zebra-candidate"]["n"], 4)
             reference = glance["comparisons"]["zebra-reference"]
             self.assertEqual((reference["n"], reference["saving_n"], reference["saving_median_ms"]),
-                             (3, 4, 49.5))
-            self.assertAlmostEqual(reference["ratio"], (99 + 1 + 102 / 101) / 3)
+                             (4, 4, 49.5))
+            self.assertAlmostEqual(reference["ratio"], 1300 / 202)
             self.assertEqual(reference["saving_ms"], 274.5)
-            self.assertLessEqual(reference["saving_ci95_ms"][0], reference["saving_ms"])
-            self.assertGreaterEqual(reference["saving_ci95_ms"][1], reference["saving_ms"])
+            self.assertIsNone(reference["saving_ci95_ms"])
             zakura = glance["comparisons"]["zakura"]
             self.assertEqual((zakura["n"], zakura["saving_n"], zakura["saving_median_ms"]),
-                             (3, 4, 100.5))
-            self.assertEqual(zakura["ratio"], 2)
+                             (4, 4, 100.5))
+            self.assertEqual(zakura["ratio"], 1403 / 202)
             self.assertEqual(zakura["saving_ms"], 300.25)
             marginal_ratio = glance["nodes"]["zebra-reference"]["mean_ms"] / glance["nodes"]["zebra-candidate"]["mean_ms"]
-            self.assertNotEqual(reference["ratio"], marginal_ratio)
+            self.assertEqual(reference["ratio"], marginal_ratio)
             for row in rows[1:]:
                 if row["target"] == "zebra-candidate":
                     row["latency_ms"] = 0
@@ -140,6 +139,53 @@ class DashboardStatisticsTests(unittest.TestCase):
         zero = data["glance"]["comparisons"]["zebra-reference"]
         self.assertEqual((zero["n"], zero["ratio"], zero["saving_ms"], zero["saving_median_ms"], zero["saving_n"]),
                          (0, None, 325, 101, 4))
+
+    def test_ratio_and_saving_headlines_agree_when_per_block_ratios_disagree(self):
+        helper = test_dispatch.DashboardTests()
+        rows = helper.records(2)
+        for row in rows[1:]:
+            i = row["height"]
+            row["latency_ms"] = {
+                "zakura": (100, 1),
+                "zebra-reference": (2, 90),
+                "zebra-candidate": (1, 100),
+            }[row["target"]][i]
+        with tempfile.TemporaryDirectory() as directory:
+            data = dashboard.collect(helper.write_records(directory, rows))
+        reference = data["glance"]["comparisons"]["zebra-reference"]
+        self.assertAlmostEqual(reference["ratio"], 92 / 101)
+        self.assertEqual(reference["saving_ms"], -4.5)
+        html = dashboard.render(data)
+        self.assertIn("1.10× slower", html)
+        self.assertIn("Adds 4.5 ms per block", html)
+        zakura = data["glance"]["comparisons"]["zakura"]
+        self.assertEqual(zakura["ratio"], 1)
+        self.assertEqual(zakura["saving_ms"], 0)
+        self.assertIn("Within 5%", html)
+
+    def test_clustered_ci_requires_pairs_and_clusters(self):
+        helper = test_dispatch.DashboardTests()
+        rows = helper.records(24)
+        for row in rows[1:]:
+            index = row["height"]
+            row["queued_unix_ms"] = row["dispatch_unix_ms"] = helper.BASE + (index // 2) * 300_000
+            row["observed_at_unix_ms"] = row["dispatch_unix_ms"] + 20
+            row["latency_ms"] = 5 if row["target"] == "zebra-candidate" else 10 + 10 * (index // 12)
+        with tempfile.TemporaryDirectory() as directory:
+            path = helper.write_records(directory, rows)
+            eligible = dashboard.collect(path)["glance"]["comparisons"]["zebra-reference"]
+            self.assertEqual(eligible["saving_n"], 24)
+            self.assertEqual(eligible["saving_ms"], 10)
+            self.assertLess(eligible["saving_ci95_ms"][0], 10)
+            self.assertGreater(eligible["saving_ci95_ms"][1], 10)
+            self.assertIn("bootstrap 95% CI [", dashboard.render(dashboard.collect(path)))
+            for row in rows[1:]:
+                if row["height"] >= 22:
+                    row["dispatch_unix_ms"] = row["queued_unix_ms"] = helper.BASE + 10 * 300_000
+                    row["observed_at_unix_ms"] = row["dispatch_unix_ms"] + 20
+            below_clusters = dashboard.collect(helper.write_records(directory, rows))["glance"]["comparisons"]["zebra-reference"]
+            self.assertEqual(below_clusters["saving_n"], 24)
+            self.assertIsNone(below_clusters["saving_ci95_ms"])
 
     def test_mean_headline_exposes_median_mode_and_bootstrap_details(self):
         helper = test_dispatch.DashboardTests()
@@ -154,12 +200,11 @@ class DashboardStatisticsTests(unittest.TestCase):
         comparison = data["glance"]["comparisons"]["zebra-reference"]
         self.assertEqual(comparison["saving_ms"], -10)
         self.assertEqual(comparison["saving_median_ms"], 9)
-        self.assertLessEqual(comparison["saving_ci95_ms"][0], -10)
-        self.assertGreaterEqual(comparison["saving_ci95_ms"][1], -10)
+        self.assertIsNone(comparison["saving_ci95_ms"])
         html = dashboard.render(data)
         self.assertIn('<p class="glance-metric">22.0 <small>ms</small></p>', html)
         self.assertIn('Median 3.0 ms; half-sample mode 2.0 ms', html)
-        self.assertIn('bootstrap 95% CI [', html)
+        self.assertIn('bootstrap 95% CI unavailable', html)
         self.assertIn('median: Saves 9.0 ms per block', html)
 
     def test_glance_recent_blocks_tiny_sizes_and_empty_rendering(self):
@@ -351,20 +396,20 @@ console.log(JSON.stringify([before,plots]));
             data = dashboard.collect(helper.write_records(directory, rows))
         bins = data["glance"]["bins"]
         tiny = bins["<20 kB"]["zebra-reference"]
-        self.assertAlmostEqual(tiny["ratio"], (99 + 1 + 102 / 101) / 3)
+        self.assertAlmostEqual(tiny["ratio"], 301 / 202)
         self.assertEqual((tiny["n"], tiny["saving_ms"], tiny["saving_median_ms"], tiny["saving_n"]),
                          (3, 33, 1, 3))
         self.assertEqual(data["mixed_load"]["<20 kB"]["medians"]["zebra-reference"] -
                          data["mixed_load"]["<20 kB"]["medians"]["zebra-candidate"], 0)
         self.assertEqual(bins["20–300 kB"]["zebra-reference"],
-                         {"ratio": 20, "n": 1, "saving_ms": 245, "saving_ci95_ms": [190, 300],
+                         {"ratio": 50, "n": 2, "saving_ms": 245, "saving_ci95_ms": None,
                           "saving_median_ms": 245, "saving_n": 2})
-        self.assertEqual(bins["20–300 kB"]["zakura"]["ratio"], 4)
+        self.assertEqual(bins["20–300 kB"]["zakura"]["ratio"], 10)
         self.assertEqual(bins[">300 kB"]["zebra-reference"],
                          {"ratio": None, "n": 0, "saving_ms": None, "saving_ci95_ms": None,
                           "saving_median_ms": None, "saving_n": 0})
         self.assertEqual(data["glance"]["nodes"]["zebra-candidate"]["n"], 4)
-        self.assertIn("<strong>20× faster</strong>", dashboard.render(data))
+        self.assertIn("<strong>50× faster</strong>", dashboard.render(data))
 
     def test_glance_short_build_label_uses_recorded_version(self):
         helper = test_dispatch.DashboardTests()

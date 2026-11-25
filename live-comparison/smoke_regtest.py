@@ -20,7 +20,6 @@ from sweep.common import Node, admit, exact_mempool, load_fixtures, require
 import dispatch
 
 
-DEFAULT_FIXTURES = Path("/home/m/zcash/zebra-benchmarks/fixtures/zakura-1.8.1/standard")
 TIMEOUT = 600
 MILESTONES = ("submit_return_ms", "tip_ms", "template_ms", "peer_told_ms", "peer_has_ms")
 
@@ -40,6 +39,7 @@ def config_for(feeder, contestants, versions):
         "network": "regtest",
         "synthetic": True,
         "mirror_mempool": True,
+        "measure_submit_paths": True,
         "mempool_poll_seconds": .05,
         "poll_interval_seconds": .02,
         "rpc_timeout_seconds": TIMEOUT,
@@ -191,7 +191,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--feeder", type=Path, required=True, metavar="BINARY")
     parser.add_argument("--contestant", action="append", required=True, metavar="LABEL=BINARY")
-    parser.add_argument("--fixture-dir", type=Path, default=DEFAULT_FIXTURES)
+    parser.add_argument("--fixture-dir", type=Path, required=True)
     parser.add_argument("--candidate", required=True, metavar="ID")
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)

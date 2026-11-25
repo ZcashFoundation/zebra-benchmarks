@@ -11,6 +11,7 @@ MAGIC = {"mainnet": bytes.fromhex("24e92764"),
          "testnet": bytes.fromhex("fa1af9bf"),
          "regtest": bytes.fromhex("aae83f5f")}
 MAX_MESSAGE = 2 * 1024 * 1024
+MAX_OBSERVED = 4_096
 
 
 def _compact_size(data, offset=0):
@@ -183,6 +184,7 @@ class Peer:
             except (OSError, ValueError, ConnectionError, TimeoutError, InterruptedError) as error:
                 if not self._stop.is_set():
                     self.errors.append(str(error))
+                    del self.errors[:-3]
             finally:
                 self.ready.clear()
                 with self._lock:
@@ -198,30 +200,35 @@ class Peer:
         address = struct.pack("<Q16sH", 0, bytes(16), socket.htons(port))
         version = (struct.pack("<IQq", min(peer_version, 170190), 0, int(time.time()))
                    + address + struct.pack("<Q16sH", 0, bytes(16), 0)
-                   + os.urandom(8) + b"\x0a/live-watch/" + struct.pack("<I", 0) + b"\0")
+                   + os.urandom(8) + b"\x0c/live-watch/" + struct.pack("<I", 0) + b"\0")
         sock.sendall(_packet(self.magic, "version", version))
         sock.sendall(_packet(self.magic, "verack"))
         requested = {}
         for command, payload, received_ns in incoming:
             if command == "verack":
                 self.ready.set()
+                self.errors.clear()
+                self.observed.clear()
             elif command == "version":
                 raise ValueError("duplicate P2P version")
             elif command == "ping" and len(payload) == 8:
                 sock.sendall(_packet(self.magic, "pong", payload))
             elif not self.ready.is_set():
                 continue
-            elif command in ("getheaders", "getblocks"):
+            elif command == "getheaders":
                 known = _locator(payload)
                 with self._lock:
                     tip_hash, parent_hash, tip_header = self._tip_hash, self._parent_hash, self._tip_header
                 has_tip = tip_hash not in known and parent_hash in known
-                if command == "getheaders":
-                    reply = b"\x01" + tip_header + b"\0" if has_tip else b"\0"
-                    sock.sendall(_packet(self.magic, "headers", reply))
-                else:
-                    reply = b"\x01" + struct.pack("<I", 2) + bytes.fromhex(tip_hash)[::-1] if has_tip else b"\0"
-                    sock.sendall(_packet(self.magic, "inv", reply))
+                reply = b"\x01" + tip_header + b"\0" if has_tip else b"\0"
+                sock.sendall(_packet(self.magic, "headers", reply))
+            elif command == "getblocks":
+                _locator(payload)
+                sock.sendall(_packet(self.magic, "inv", b"\0"))
+            elif command == "getaddr":
+                sock.sendall(_packet(self.magic, "addr", b"\0"))
+            elif command == "mempool":
+                sock.sendall(_packet(self.magic, "inv", b"\0"))
             elif command == "getdata":
                 sock.sendall(_packet(self.magic, "notfound", payload))
             elif command == "notfound":
@@ -236,6 +243,10 @@ class Peer:
             else:
                 for block_hash in announcements(command, payload):
                     entry = self.observed.setdefault(block_hash, {"peer_told_ns": received_ns, "peer_has_ns": None})
+                    if len(self.observed) > MAX_OBSERVED:
+                        evicted = next(iter(self.observed))
+                        del self.observed[evicted]
+                        requested.pop(evicted, None)
                     if block_hash not in requested and entry["peer_has_ns"] is None:
                         requested[block_hash] = None
                         if len(requested) > 64:
@@ -258,7 +269,6 @@ class TemplateWatch:
         self._thread = None
         self._rpc = None
         self._pending = None
-        self._serial = 0
 
     def start(self):
         if self._thread is None:
@@ -280,25 +290,21 @@ class TemplateWatch:
         deadline = time.perf_counter() + timeout
         with self._changed:
             while not self._stop.is_set():
+                if self._pending == parent_hash.lower() and self.ready.is_set():
+                    return
                 left = deadline - time.perf_counter()
                 if left <= 0:
                     break
-                if self._pending != parent_hash.lower() or not self.ready.is_set():
-                    self._changed.wait(left)
-                    continue
-                serial = self._serial
-                self._changed.wait(min(.1, left))
-                if self._pending == parent_hash.lower() and self._serial == serial and self.ready.is_set():
-                    return
+                self._changed.wait(left)
         raise TimeoutError(f"no outstanding long poll on parent {parent_hash}: {self.errors[-3:]}")
 
     def _sent(self):
         with self._changed:
             self.ready.set()
+            self.errors.clear()
             self._changed.notify_all()
 
     def _run(self):
-        last_error = None
         while not self._stop.is_set():
             rpc = None
             try:
@@ -310,28 +316,33 @@ class TemplateWatch:
                     parent = template["previousblockhash"].lower()
                     longpoll_id = template["longpollid"]
                     with self._changed:
-                        self._serial += 1
                         self._pending = parent
                         self._changed.notify_all()
                     try:
-                        template = rpc.longpoll(longpoll_id, self._sent)
-                        received_ns = time.perf_counter_ns()
+                        response_ns = None
+                        def on_response():
+                            nonlocal response_ns
+                            response_ns = time.perf_counter_ns()
+                        template = rpc.longpoll(longpoll_id, self._sent, on_response)
                     finally:
                         with self._changed:
                             self._pending = None
                             self.ready.clear()
                             self._changed.notify_all()
                     new_parent = template["previousblockhash"].lower()
+                    if response_ns is None:
+                        raise ValueError("long poll returned without response notification")
                     if new_parent != parent:
-                        self.observed.setdefault(new_parent, received_ns)
+                        self.observed.setdefault(new_parent, response_ns)
+                        if len(self.observed) > MAX_OBSERVED:
+                            del self.observed[next(iter(self.observed))]
             except Exception as error:
                 if not self._stop.is_set():
                     message = str(error)
+                    if self._on_error is not None and (not self.errors or self.errors[-1] != message):
+                        self._on_error(message)
                     self.errors.append(message)
                     del self.errors[:-3]
-                    if self._on_error is not None and message != last_error:
-                        self._on_error(message)
-                    last_error = message
             finally:
                 with self._changed:
                     self._rpc = None

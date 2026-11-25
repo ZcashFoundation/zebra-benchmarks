@@ -241,6 +241,95 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(paired([2, 2, 2], resamples=100),
                          {"mean": 2, "median": 2, "mean_ci95": [2, 2]})
 
+    def test_submit_paths_and_mirror_relay_validation(self):
+        first = attempt()
+        path = {"event": "submit_paths", "hash": first["hash"], "height": 0,
+                "block_bytes": first["block_bytes"], "target": "a",
+                "client": "Zebra", "version": "test", "queued_unix_ms": 1000,
+                "dispatch_unix_ms": 1000, "observed_at_unix_ms": 1100,
+                "outcome": "accepted", "detail": None, "catch_up": False,
+                **{key: None for key in report.MILESTONES}}
+        relay = {"event": "mempool_relay", "txid": "a" * 64, "target": "a",
+                 "observed_at_unix_ms": 1000, "outcome": "error",
+                 "error": "source fetch failed", "latency_ms": None}
+        report.validate(path)
+        report.validate(relay)
+        for bad in (dict(path, submit_return_ms=float("nan")),
+                    dict(path, peer_has_ms=-1), dict(path, tip_ms="5"),
+                    dict(path, hash="oops"), dict(path, catch_up=0),
+                    dict(path, observed_at_unix_ms=999),
+                    dict(relay, txid="bad"), dict(relay, latency_ms=-1),
+                    dict(relay, dispatch_unix_ms=1001),
+                    dict(relay, observed_at_unix_ms=True),
+                    dict(relay, outcome="unexpected"),
+                    {k: v for k, v in relay.items() if k != "error"},
+                    {k: v for k, v in relay.items() if k != "latency_ms"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                report.validate(bad)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "records.jsonl"
+            source.write_text(json.dumps(path) + "\n" + json.dumps(dict(relay, txid="bad")) + "\n")
+            with self.assertRaisesRegex(ValueError, r"records.jsonl:2:"):
+                report.load_records(source)
+
+    def test_submit_path_milestones_pair_by_block_and_mirror_acceptance(self):
+        rows = [session()]
+        for i in range(24):
+            at = (i // 2) * report.WINDOW_MS + 1000
+            for target, elapsed in (("a", 100 if i >= 22 else 5), ("b", 7)):
+                submission = attempt(i, target, at=at)
+                rows.append(submission)
+                rows.append({"event": "submit_paths", "hash": submission["hash"],
+                             "height": i, "block_bytes": submission["block_bytes"],
+                             "target": target, "client": "Zebra", "version": "test",
+                             "queued_unix_ms": at, "dispatch_unix_ms": at,
+                             "observed_at_unix_ms": at + 100, "outcome": "accepted",
+                             "detail": None, "catch_up": False,
+                             "rpc_round_trip_ms": 10, "submit_return_ms": elapsed,
+                             "tip_ms": None if target == "b" and i == 0 else elapsed + 1,
+                             "template_ms": elapsed + 2 if target == "a" or i < 19 else None,
+                             "peer_told_ms": None, "peer_has_ms": None})
+        rows.extend(({"event": "mempool_relay", "txid": "a" * 64, "target": "a",
+                      "dispatch_unix_ms": 1000, "observed_at_unix_ms": 1100,
+                      "outcome": "accepted", "error": None, "latency_ms": 1},
+                     {"event": "mempool_relay", "txid": "b" * 64, "target": "a",
+                      "observed_at_unix_ms": 1200, "outcome": "error",
+                      "error": "source fetch", "latency_ms": None},
+                     {"event": "mempool_relay", "txid": "a" * 64, "target": "b",
+                      "observed_at_unix_ms": 1200, "outcome": "rejected",
+                      "error": "rejected", "latency_ms": 2}))
+        result = report.make_report(rows, 0, 12 * report.WINDOW_MS)
+        self.assertEqual(result["selection"]["pairs"][0]["eligible_pairs"], 24)
+        milestone = result["submit_paths"]["milestones"]["submit_return_ms"]
+        self.assertEqual(milestone["contestants"]["a"]["n"], 24)
+        self.assertEqual(milestone["contestants"]["a"]["median_ms"], 5)
+        self.assertEqual(milestone["contestants"]["a"]["mode_ms"], 5)
+        self.assertAlmostEqual(milestone["contestants"]["a"]["mean_ms"], (22 * 5 + 2 * 100) / 24)
+        pair = milestone["pairs"][0]
+        self.assertEqual(pair["eligible_pairs"], 24)
+        self.assertAlmostEqual(pair["paired_mean_right_minus_left_ms"], (22 * 2 - 2 * 93) / 24)
+        self.assertEqual(pair["paired_median_right_minus_left_ms"], 2)
+        self.assertEqual(pair["evidence"], "exploratory")
+        self.assertIsNotNone(pair["interval"]["lower_ms"])
+        self.assertIsNotNone(pair["interval"]["upper_ms"])
+        self.assertEqual(result["submit_paths"]["milestones"]["tip_ms"]["pairs"][0]["eligible_pairs"], 23)
+        short = result["submit_paths"]["milestones"]["template_ms"]["pairs"][0]
+        self.assertEqual(short["eligible_pairs"], 19)
+        self.assertEqual(short["evidence"], "insufficient_pairs")
+        self.assertIsNone(short["interval"]["lower_ms"])
+        self.assertEqual(result["submit_paths"]["milestones"]["peer_has_ms"]["contestants"]["a"]["n"], 0)
+        self.assertEqual(result["mempool_relay"]["a"], {"attempts": 2, "accepted": 1, "acceptance_rate": .5})
+        self.assertEqual(result["mempool_relay"]["b"], {"attempts": 1, "accepted": 0, "acceptance_rate": 0})
+        without = report.make_report([row for row in rows if row["event"] not in ("submit_paths", "mempool_relay")],
+                                     0, 12 * report.WINDOW_MS)
+        self.assertEqual(result["selection"], without["selection"])
+        self.assertNotEqual(result["report_id"], without["report_id"])
+        mismatched = [dict(row, height=999) if row["event"] == "submit_paths"
+                      and row["target"] == "b" and row["height"] == 0 else row for row in rows]
+        different = report.make_report(mismatched, 0, 12 * report.WINDOW_MS)
+        self.assertEqual(different["submit_paths"]["milestones"]["submit_return_ms"]["pairs"][0]["eligible_pairs"], 23)
+        self.assertEqual(different["selection"], result["selection"])
+
     def test_site_and_rolling_are_relative_to_log(self):
         latest = report.DAY_MS + 1000
         rows = [session(), attempt(0, "a", at=100), attempt(0, "b", at=100),
@@ -263,6 +352,8 @@ class ReportTests(unittest.TestCase):
             self.assertIn("Mean right − left", html)
             self.assertIn("paired_median_right_minus_left_ms", html)
             self.assertIn("Half-sample mode", html)
+            self.assertIn("Submit-path milestones since dispatch", html)
+            self.assertIn("Mempool mirror RPC acceptance", html)
             for entry in index["reports"]:
                 self.assertEqual(entry["start_unix_ms"] % report.WINDOW_MS, 0)
                 self.assertTrue((output / "reports" / entry["report_id"] / "report.json").is_file())
