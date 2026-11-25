@@ -13,7 +13,7 @@ MAGIC = {
     "testnet": bytes.fromhex("fa1af9bf"),
     "regtest": bytes.fromhex("aae83f5f"),
 }
-MAX_MESSAGE = 2_000_000
+MAX_MESSAGE = 2 * 1024 * 1024  # Zebra's MAX_PROTOCOL_MESSAGE_LEN
 
 
 def _compact_size(data, offset=0):

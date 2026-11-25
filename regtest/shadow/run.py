@@ -269,7 +269,8 @@ def _measure(block, raw, nodes, main_rpc, file, timeout):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             peer_seen = state["peer"].observed.get(block["hash"], {})
-            if block["hash"] in state["template"].observed and "peer_has_ns" in peer_seen:
+            # The observer adds `peer_has_ns: None` on announcement; wait for the block itself.
+            if block["hash"] in state["template"].observed and peer_seen.get("peer_has_ns") is not None:
                 break
             time.sleep(0.005)
         stamps["tip"] = tip_observed.get("tip")
