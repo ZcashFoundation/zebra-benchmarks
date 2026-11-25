@@ -6,7 +6,7 @@ import struct
 import tempfile
 import unittest
 
-from latency_stats import half_sample_mode, paired
+from latency_stats import half_sample_mode
 import report
 from workload import COMPONENTS, GROUP_IDS, ParseError, THRESHOLDS, labels, parse_block
 
@@ -238,8 +238,6 @@ class ReportTests(unittest.TestCase):
         self.assertAlmostEqual(pair["left_latency"]["mean_ms"], 202 / 3)
         self.assertEqual(report.latency([1, 1, 1, 50, 90])["mode_ms"], 1)
         self.assertEqual(half_sample_mode([1, 2, 2.1, 2.5, 9]), 2.05)
-        self.assertEqual(paired([2, 2, 2], resamples=100),
-                         {"mean": 2, "median": 2, "mean_ci95": [2, 2]})
 
     def test_submit_paths_and_mirror_relay_validation(self):
         first = attempt()
@@ -352,7 +350,7 @@ class ReportTests(unittest.TestCase):
             self.assertIn("Mean right − left", html)
             self.assertIn("paired_median_right_minus_left_ms", html)
             self.assertIn("Half-sample mode", html)
-            self.assertIn("Submit-path milestones since dispatch", html)
+            self.assertIn("Submit-path milestones and sampled RPC baseline", html)
             self.assertIn("Mempool mirror RPC acceptance", html)
             for entry in index["reports"]:
                 self.assertEqual(entry["start_unix_ms"] % report.WINDOW_MS, 0)

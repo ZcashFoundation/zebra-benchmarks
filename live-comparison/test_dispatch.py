@@ -140,7 +140,14 @@ class FakeNode:
             self.pool.add(txid)
             return txid
         if method == "getblocktemplate":
-            return {"height": self.height + 1, "transactions": []}
+            if params and "longpollid" in params[0]:
+                previous_height = int(params[0]["longpollid"])
+                deadline = time.monotonic() + 5
+                while self.height == previous_height and time.monotonic() < deadline:
+                    time.sleep(.005)
+            return {"height": self.height + 1, "transactions": [],
+                    "previousblockhash": self.chain[self.height]["hash"],
+                    "longpollid": str(self.height)}
         if method == "submitblock":
             block = next(block for block in self.chain if block["raw"] == params[0])
             height = block["height"]
@@ -353,6 +360,8 @@ class DispatchTests(unittest.TestCase):
                            if row["event"] == "submitblock_call" and not row["catch_up"])
             self.assertLess(attempt["dispatch_delay_ms"], 100)
             self.assertEqual(attempt["outcome"], "accepted")
+            path_row = next(row for row in read_records(path) if row["event"] == "submit_paths")
+            self.assertIsNotNone(path_row["template_ms"])
             self.assertTrue(any(method == "getblockcount" for method, _ in node.calls))
 
     def test_tip_deadline_starts_when_submit_returns(self):

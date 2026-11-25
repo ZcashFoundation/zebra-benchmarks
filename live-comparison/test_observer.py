@@ -97,6 +97,11 @@ class PeerTests(unittest.TestCase):
             eventually(lambda: peer.observed[block_hash]["peer_has_ns"] is not None)
             self.assertGreaterEqual(peer.observed[block_hash]["peer_has_ns"],
                                     peer.observed[block_hash]["peer_told_ns"])
+            client.sendall(_packet(peer.magic, "verack"))
+            client.sendall(_packet(peer.magic, "ping", b"12345678"))
+            self.assertEqual(message(client)[1:], (b"pong", b"12345678"))
+            self.assertIn(block_hash, peer.observed)
+            self.assertIn("stale disconnect", peer.errors)
         finally:
             peer._stop.set()
             client.close()
@@ -126,6 +131,25 @@ class PeerTests(unittest.TestCase):
             finally:
                 peer.stop()
         self.assertFalse(peer._thread.is_alive())
+
+
+    def test_lookup_error_is_recorded_after_connection(self):
+        block_hash, block_header = header()
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(3)
+            peer = Peer(f"127.0.0.1:{listener.getsockname()[1]}", "regtest", block_hash,
+                        block_header)
+            def fail(_sock, _port):
+                raise LookupError("evicted announcement")
+            peer._connected = fail
+            peer.start()
+            try:
+                with listener.accept()[0]:
+                    eventually(lambda: "evicted announcement" in peer.errors)
+            finally:
+                peer.stop()
 
 
 class FakeRPC:
@@ -191,6 +215,32 @@ class TemplateWatchTests(unittest.TestCase):
         finally:
             watch.stop()
         self.assertFalse(watch._thread.is_alive())
+
+    def test_not_synced_errors_deduplicate_by_rpc_code(self):
+        errors = []
+
+        class NotSynced(Exception):
+            code = -10
+
+        class UnreadyRPC:
+            calls = 0
+
+            def call(self, _method):
+                self.calls += 1
+                raise NotSynced(f"not synced: {self.calls} seconds since tip")
+
+            def cancel_longpoll(self):
+                pass
+
+        rpc = UnreadyRPC()
+        watch = TemplateWatch(lambda: rpc, errors.append)
+        watch.start()
+        try:
+            eventually(lambda: rpc.calls >= 2)
+        finally:
+            watch.stop()
+        self.assertEqual(len(errors), 1)
+        self.assertIn("not synced:", errors[0])
 
 
 if __name__ == "__main__":

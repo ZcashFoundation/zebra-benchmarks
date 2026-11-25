@@ -103,6 +103,8 @@ class RPC:
                            "params": [{"longpollid": longpoll_id}]}).encode()
         try:
             connection.request("POST", url.path or "/", body, self.headers())
+            if connection.sock is not None:
+                connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             on_sent()
             response = connection.getresponse()
             on_response()
@@ -340,6 +342,7 @@ class Dispatcher:
         rpc = RPC(node, min(self.config["rpc_timeout_seconds"], 2))
         start.wait()
         deadline = None
+        reported = False
         while not self.stop.is_set():
             if finished.is_set() and deadline is None:
                 deadline = observed["returned_ns"] + int(
@@ -351,9 +354,11 @@ class Dispatcher:
                     observed["tip"] = time.perf_counter_ns()
                     return
             except (OSError, ValueError, RPCError) as error:
-                errors.append(f"tip poll: {error}")
+                if not reported:
+                    errors.append(f"tip poll: {error}")
+                    reported = True
             self.stop.wait(.001)
-        if not self.stop.is_set():
+        if not self.stop.is_set() and not reported:
             errors.append("tip poll: timed out")
 
     def observe_submit(self, node, block, dispatch, started, returned, label, detail, round_trip,
@@ -664,6 +669,7 @@ class Dispatcher:
                 try:
                     self.round_trips[node["name"]] = rpc_round_trip(rpc)
                 except (OSError, ValueError, RPCError) as error:
+                    self.round_trips.pop(node["name"], None)
                     self.diagnostic(node["name"], f"RPC round trip: {error}")
             if "pid" in node:
                 current = None

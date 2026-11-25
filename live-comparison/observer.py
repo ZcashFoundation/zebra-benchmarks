@@ -181,7 +181,7 @@ class Peer:
                     with self._lock:
                         self._socket = sock
                     self._connected(sock, int(port))
-            except (OSError, ValueError, ConnectionError, TimeoutError, InterruptedError) as error:
+            except (OSError, ValueError, ConnectionError, TimeoutError, InterruptedError, LookupError) as error:
                 if not self._stop.is_set():
                     self.errors.append(str(error))
                     del self.errors[:-3]
@@ -204,11 +204,12 @@ class Peer:
         sock.sendall(_packet(self.magic, "version", version))
         sock.sendall(_packet(self.magic, "verack"))
         requested = {}
+        self.errors.clear()
+        self.observed.clear()
+        requested.clear()
         for command, payload, received_ns in incoming:
             if command == "verack":
                 self.ready.set()
-                self.errors.clear()
-                self.observed.clear()
             elif command == "version":
                 raise ValueError("duplicate P2P version")
             elif command == "ping" and len(payload) == 8:
@@ -268,6 +269,7 @@ class TemplateWatch:
         self._changed = threading.Condition()
         self._thread = None
         self._rpc = None
+        self._last_error_key = None
         self._pending = None
 
     def start(self):
@@ -301,6 +303,7 @@ class TemplateWatch:
     def _sent(self):
         with self._changed:
             self.ready.set()
+            self._last_error_key = None
             self.errors.clear()
             self._changed.notify_all()
 
@@ -339,8 +342,10 @@ class TemplateWatch:
             except Exception as error:
                 if not self._stop.is_set():
                     message = str(error)
-                    if self._on_error is not None and (not self.errors or self.errors[-1] != message):
+                    key = ("rpc", error.code) if getattr(error, "code", None) is not None else message
+                    if self._on_error is not None and key != self._last_error_key:
                         self._on_error(message)
+                    self._last_error_key = key
                     self.errors.append(message)
                     del self.errors[:-3]
             finally:

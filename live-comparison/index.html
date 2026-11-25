@@ -27,8 +27,9 @@
   <p>Catch-up and ineligible attempts do not enter latency comparisons. Five minutes often yields fewer
     than 20 pairs; an absent 95% paired-mean bootstrap interval is not evidence of equality. Intervals
     resample occupied five-minute clusters. See coverage and errors before comparing.</p>
-  <p>Optional submit-path milestones measure elapsed time since dispatch (not independent RPC calls).
-    Matched, first accepted blocks are compared by milestone; missing observer timestamps are omitted, not zero.
+  <p>Optional submit-path milestones measure elapsed time since dispatch; <code>rpc_round_trip_ms</code>
+    is a separate sampled baseline from ten RPC calls, not time since dispatch. Matched, first accepted
+    blocks are compared by milestone; missing observer timestamps are omitted, not zero.
     Mempool mirror acceptance is accepted relay events divided by recorded relay attempts per contestant,
     not proof of network-wide transaction propagation.</p>
   <button id="refresh" type="button">Refresh reports</button>
@@ -108,15 +109,18 @@ function render(section, report, url) {
   const milestones = report.submit_paths?.milestones || {};
   if (Object.values(milestones).some(group =>
     Object.values(group.contestants || {}).some(sample => sample.n))) {
-    table(section, 'Submit-path milestones since dispatch (ms)', ['Milestone', 'Target', 'n', 'Mean', 'Median', 'Half-sample mode'],
+    table(section, 'Submit-path milestones and sampled RPC baseline (ms)',
+      ['Milestone', 'Target', 'n', 'Mean', 'Median', 'Half-sample mode'],
       Object.entries(milestones).flatMap(([name, group]) =>
         Object.entries(group.contestants || {}).map(([target, sample]) =>
-          [name, target, number(sample.n), number(sample.mean_ms), number(sample.median_ms), number(sample.mode_ms)])));
-    table(section, 'Same-block submit-path differences (ms)',
+          [name === 'rpc_round_trip_ms' ? 'RPC round trip (sampled baseline)' : name,
+            target, number(sample.n), number(sample.mean_ms), number(sample.median_ms), number(sample.mode_ms)])));
+    table(section, 'Paired submit-path differences and sampled RPC baseline (ms)',
       ['Milestone', 'Left', 'Right', 'Pairs', 'Mean right − left', 'Mean bootstrap 95% CI',
         'Median right − left', 'Clusters', 'Evidence'],
       Object.entries(milestones).flatMap(([name, group]) =>
-        (group.pairs || []).map(pair => [name, pair.left, pair.right, number(pair.eligible_pairs),
+        (group.pairs || []).map(pair => [name === 'rpc_round_trip_ms' ? 'RPC round trip (sampled baseline)' : name,
+          pair.left, pair.right, number(pair.eligible_pairs),
           number(pair.paired_mean_right_minus_left_ms),
           pair.interval?.lower_ms != null && pair.interval?.upper_ms != null
             ? `${number(pair.interval.lower_ms)} to ${number(pair.interval.upper_ms)}` : 'not available',
