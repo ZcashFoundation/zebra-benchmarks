@@ -86,12 +86,24 @@ def _messages(sock, magic, stop, ready):
 
 def _announcements(command, payload):
     if command == "inv":
+        # ZIP 239: MSG_WTX (5) entries carry a txid and an auth digest; other types one hash.
         count, offset = _compact_size(payload)
-        if count > 50_000 or len(payload) != offset + count * 36:
+        if count > 50_000:
             raise ValueError("invalid block inventory")
-        return [payload[i + 4:i + 36][::-1].hex()
-                for i in range(offset, len(payload), 36)
-                if struct.unpack_from("<I", payload, i)[0] == 2]
+        blocks = []
+        for _ in range(count):
+            if offset + 4 > len(payload):
+                raise ValueError("invalid block inventory")
+            kind = struct.unpack_from("<I", payload, offset)[0]
+            end = offset + 4 + (64 if kind == 5 else 32)
+            if end > len(payload):
+                raise ValueError("invalid block inventory")
+            if kind == 2:
+                blocks.append(payload[offset + 4:end][::-1].hex())
+            offset = end
+        if offset != len(payload):
+            raise ValueError("invalid block inventory")
+        return blocks
     if command == "headers":
         count, offset = _compact_size(payload)
         if count > 2_000:

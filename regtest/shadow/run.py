@@ -31,12 +31,17 @@ class RPC:
             self.conn.close()
             self.conn = None
 
-    def call(self, method, params=None, on_sent=None):
+    def encode(self, method, params=None):
+        self.request_id += 1
+        return json.dumps({"jsonrpc": "2.0", "id": self.request_id,
+                           "method": method, "params": params or []}).encode()
+
+    def call(self, method, params=None, on_sent=None, body=None):
+        """`body` is a request from `encode`, so large submits can be built before a barrier."""
         if self.conn is None:
             self.conn = self.connection_type(self.host, self.port, timeout=self.timeout)
-        self.request_id += 1
-        body = json.dumps({"jsonrpc": "2.0", "id": self.request_id,
-                           "method": method, "params": params or []})
+        if body is None:
+            body = self.encode(method, params)
         auth = Path(self.cookie_file).read_text().strip() if self.cookie_file else self.auth
         headers = {"Content-Type": "application/json"}
         if auth:
@@ -238,6 +243,9 @@ def _measure(block, raw, nodes, main_rpc, file, timeout):
 
     def submit(label, state, before, errors):
         rpc = state["rpc"]
+        # Encoding a 2 MB block under the GIL takes milliseconds; do it before the barrier so all
+        # nodes are sent the block at the same moment.
+        body = rpc.encode("submitblock", [raw])
         start = threading.Event()
         tip_observed = {}
         tip_thread = threading.Thread(target=_tip_watch,
@@ -251,7 +259,7 @@ def _measure(block, raw, nodes, main_rpc, file, timeout):
         answer = None
         stamps = {key: None for key in ("submit_return", "tip", "template", "peer_told", "peer_has")}
         try:
-            answer = rpc.call("submitblock", [raw])
+            answer = rpc.call("submitblock", body=body)
             if answer is not None:
                 errors.append("submitblock rejected: " + str(answer))
         except Exception as exc:

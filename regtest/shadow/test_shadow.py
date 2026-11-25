@@ -1,10 +1,12 @@
 """Pure benchmark accounting checks; no node or network required."""
 import json
 from pathlib import Path
+import struct
 import tempfile
 import unittest
 from unittest.mock import Mock
 
+from shadow.observer import _announcements
 from shadow.run import _ancestors, new_txids, row_for
 from shadow.summarize import summarize
 
@@ -65,6 +67,13 @@ class ShadowAccounting(unittest.TestCase):
             self.assertEqual(result["paired"]["candidate"]["tip_ms"]["median"], 2)
             self.assertEqual(result["paired"]["candidate"]["tip_ms"]["mean_ci95"], [2, 2])
             self.assertEqual(result["mirror"]["candidate"]["acceptance_rate"], .5)
+
+    def test_inventory_with_wtx_entries_yields_only_blocks(self):
+        # Mirrored v5 transactions make peers gossip ZIP 239 MSG_WTX entries (txid + auth digest).
+        block = bytes(range(32))
+        payload = (bytes([3]) + struct.pack("<I", 5) + bytes(64) + struct.pack("<I", 2) + block
+                   + struct.pack("<I", 1) + bytes(32))
+        self.assertEqual(_announcements("inv", payload), [block[::-1].hex()])
 
 
 if __name__ == "__main__":
