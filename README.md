@@ -9,6 +9,7 @@ The measurements are distinct: Regtest mining paths; RPC and full-verification r
 | Directory | Purpose |
 |---|---|
 | `regtest/` | Final V5 campaign, fixture generation, node runtime, RPC and replay |
+| `crypto-ab/` | Paired cold-submitblock crypto A/B and 330-action Orchard fixture producer |
 | `initial-sync/` | Mainnet snapshot preparation, checkpoint sync and phase attribution |
 | `pruning/` | Download, extract, prune, compact and paired replay |
 | `pruning/snapshot-production/` | Separate, later snapshot-refresh workflow |
@@ -105,7 +106,7 @@ git -C "$WORK/zakura-reference" checkout --detach f5c20398c629c8179364b07f059da3
 (cd "$WORK/zakura-reference" && bash "$HARNESS/regtest/build-zakura.sh" zakurad-reference)
 ```
 
-The Zebra recipe is `RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zebrad --features default-release-binaries,internal-miner`, adding `pasta-asm` only for the assembly arm. The Zakura recipe is `RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zakura --bin zakurad --features default-release-binaries`.
+The Zebra recipe is `RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zebrad --features default-release-binaries,internal-miner`, adding `pasta-asm` only for the assembly arm. The Zakura recipe is `RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zakura --bin zakurad --features default-release-binaries`. Both builders take another `RUSTUP_TOOLCHAIN` and record it in the receipt; keep one toolchain across a campaign's arms.
 
 Zakura v1.8.1's `default-release-binaries` now includes `x86_64-asm` and `indexer-rpc` as well as Prometheus and the release INFO log ceiling. Its default x86-64 build requires BMI2 and ADX; do not silently substitute a `portable` build in the same campaign.
 

@@ -6,7 +6,7 @@ if [[ $# != 1 || ${1:-} == --help || ${1:-} == -h ]]; then
 Usage: bash build-zakura.sh BINARY_NAME
 Run inside a clean Zakura checkout at ZAKURA_MAIN_REVISION (default: v1.8.1,
 f5c20398c629c8179364b07f059da3c814af78ec).
-Builds locked Rust 1.97.0 release package zakura, binary zakurad, with features
+Builds locked release package zakura with RUSTUP_TOOLCHAIN (default 1.97.0), binary zakurad, with features
 default-release-binaries. BENCH_BINS selects output directory (default:
 repository-root/bins). Writes BINARY_NAME and BINARY_NAME.build.json.
 Public source: https://github.com/zakura-core/zakura
@@ -24,8 +24,9 @@ cd "$(git rev-parse --show-toplevel)"
 source=$(git rev-parse HEAD)
 [[ $source == "$pin" ]] || { echo "HEAD must be $pin, not $source" >&2; exit 2; }
 [[ -z $(git status --porcelain --untracked-files=no) ]] || { echo 'Dirty tracked worktree' >&2; exit 2; }
-recipe='RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zakura --bin zakurad --features default-release-binaries'
-export RUSTUP_TOOLCHAIN=1.97.0
+toolchain=${RUSTUP_TOOLCHAIN:-1.97.0}
+recipe="RUSTUP_TOOLCHAIN=$toolchain cargo build --locked --release -p zakura --bin zakurad --features default-release-binaries"
+export RUSTUP_TOOLCHAIN=$toolchain
 cargo build --locked --release -p zakura --bin zakurad --features default-release-binaries
 target=$(cargo metadata --locked --format-version 1 --no-deps |
     python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
