@@ -16,11 +16,13 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import tomllib
 
-import dispatch
 import dashboard
+import dispatch
 import load_intervals
+from observer import MAX_MESSAGE, TemplateWatch, _messages, announcements
 
 
 def make_chain(count):
@@ -41,12 +43,17 @@ def make_chain(count):
 
 
 class FakeNode:
-    def __init__(self, chain, height=0, behavior=None, delay=0, auth=None):
+    def __init__(self, chain, height=0, behavior=None, delay=0, auth=None,
+                 txs=None, pool=None, tx_behavior=None):
         self.chain = chain
         self.height = height
         self.behavior = behavior or {}
         self.delay = delay
         self.auth = auth
+        self.txs = txs or {}
+        self.pool = set(pool or ())
+        self.tx_behavior = tx_behavior or {}
+        self.tx_attempts = []
         self.attempts = []
         self.calls = []
         self.lock = threading.Lock()
@@ -95,6 +102,8 @@ class FakeNode:
     def call(self, method, params):
         with self.lock:
             self.calls.append((method, time.monotonic()))
+        if method == "getblockcount":
+            return self.height
         if method == "getbestblockhash":
             return self.chain[self.height]["hash"]
         if method == "getblockhash":
@@ -105,8 +114,41 @@ class FakeNode:
             block = next(block for block in self.chain if block["hash"] == params[0])
             return block["raw"] if method == "getblock" else {
                 key: value for key, value in block.items() if key != "raw"}
+        if method == "getrawmempool":
+            return ({txid: {"depends": self.txs[txid]["depends"]} for txid in self.txs
+                     if txid in self.pool} if params and params[0] else list(self.pool))
+        if method == "getrawtransaction":
+            txid = params[0]
+            if txid not in self.pool:
+                raise dispatch.RPCError({"code": -5, "message": "transaction not in mempool"})
+            return self.txs[txid]["raw"]
+        if method == "sendrawtransaction":
+            raw = params[0]
+            txid = next((key for key, info in self.txs.items() if info["raw"] == raw), None)
+            if txid is None:
+                raise dispatch.RPCError({"code": -22, "message": "unknown transaction"})
+            with self.lock:
+                self.tx_attempts.append(txid)
+            behavior = self.tx_behavior.get(txid)
+            if behavior == "reject":
+                raise dispatch.RPCError({"code": -26, "message": "policy rejection"})
+            if behavior == "duplicate_chain":
+                raise dispatch.RPCError({"code": -27, "message": "already in chain"})
+            if txid in self.pool or behavior == "duplicate_mempool":
+                raise dispatch.RPCError({"code": -1, "message": "transaction already exists in mempool"})
+            if not set(self.txs[txid]["depends"]) <= self.pool:
+                raise dispatch.RPCError({"code": -25, "message": "missing mempool parent"})
+            self.pool.add(txid)
+            return txid
         if method == "getblocktemplate":
-            return {"height": self.height + 1, "transactions": []}
+            if params and "longpollid" in params[0]:
+                previous_height = int(params[0]["longpollid"])
+                deadline = time.monotonic() + 5
+                while self.height == previous_height and time.monotonic() < deadline:
+                    time.sleep(.005)
+            return {"height": self.height + 1, "transactions": [],
+                    "previousblockhash": self.chain[self.height]["hash"],
+                    "longpollid": str(self.height)}
         if method == "submitblock":
             block = next(block for block in self.chain if block["raw"] == params[0])
             height = block["height"]
@@ -137,7 +179,7 @@ def config_for(feeder, nodes):
          "pid": os.getpid()} for i, node in enumerate(nodes)],
         "poll_interval_seconds": .02, "rpc_timeout_seconds": .1,
         "sample_interval_seconds": .05, "template_timeout_seconds": .1,
-        "pause_threshold_seconds": 2, "synthetic": True}
+        "pause_threshold_seconds": 2, "synthetic": True, "network": "mainnet"}
 
 
 def eventually(predicate, timeout=4):
@@ -199,6 +241,219 @@ class DispatchTests(unittest.TestCase):
         for code, label in [(-25, "rejected"), (-26, "rejected"), (-27, "duplicate"),
                             (-32603, "error")]:
             self.assertEqual(dispatch.outcome(error=dispatch.RPCError({"code": code}))[0], label)
+
+    def test_observer_inventory_and_message_limit(self):
+        block = bytes(range(32))
+        payload = (b"\x03" + struct.pack("<I", 5) + bytes(64) +
+                   struct.pack("<I", 2) + block + struct.pack("<I", 1) + bytes(32))
+        self.assertEqual(announcements("inv", payload), [block[::-1].hex()])
+        with self.assertRaisesRegex(ValueError, "invalid block inventory"):
+            announcements("inv", payload[:-1])
+        header = (bytes.fromhex("24e92764") + b"inv".ljust(12, b"\0") +
+                  struct.pack("<I", MAX_MESSAGE + 1) + bytes(4))
+
+        class Socket:
+            def recv(self, _):
+                return header
+
+        with self.assertRaisesRegex(ValueError, "invalid P2P message header"):
+            next(_messages(Socket(), bytes.fromhex("24e92764"), threading.Event(), threading.Event()))
+
+    def test_mempool_diff_forgets_departed_transactions(self):
+        seen = {"a", "b"}
+        current = {"b", "c"}
+        self.assertEqual(dispatch.new_txids(seen, current), {"c"})
+        seen.intersection_update(current)
+        self.assertEqual(dispatch.new_txids(seen, {"a", "b"}), {"a"})
+
+    def test_submit_paths_uses_one_clock_and_preserves_missing_milestones(self):
+        block = dispatch.Block("ab" * 32, 42, "cd" * 32, "00" * 150, 700, False)
+        node = {"name": "candidate", "client": "Zebra", "version": "test"}
+        row = dispatch.submit_paths(block, node, 710, 1_000_000_000,
+                                    {"submit_return": 1_012_000_000,
+                                     "tip": 1_009_000_000, "template": None,
+                                     "peer_told": 1_011_000_000, "peer_has": 1_013_000_000},
+                                    "accepted", None, 3.5)
+        self.assertEqual(row["event"], "submit_paths")
+        self.assertEqual(row["dispatch_unix_ms"], 710)
+        self.assertEqual(row["rpc_round_trip_ms"], 3.5)
+        self.assertEqual([row[key] for key in
+                          ("submit_return_ms", "tip_ms", "peer_told_ms", "peer_has_ms")],
+                         [12, 9, 11, 13])
+        self.assertIsNone(row["template_ms"])
+
+    def test_parent_first_orders_dependencies_and_rejects_cycles(self):
+        parent, child = "f" * 64, "a" * 64
+        self.assertEqual(dispatch.parent_first({child: {"depends": [parent]},
+                                                parent: {"depends": []}}), [parent, child])
+        with self.assertRaisesRegex(ValueError, "cyclic"):
+            dispatch.parent_first({child: {"depends": [parent]},
+                                   parent: {"depends": [child]}})
+
+    def test_mirror_deduplicates_and_retries_only_after_departure_or_tip_change(self):
+        chain = make_chain(2)
+        parent, child, flaky = ("f" * 64, "a" * 64, "b" * 64)
+        txs = {child: {"raw": "01", "depends": [parent]},
+               flaky: {"raw": "02", "depends": []},
+               parent: {"raw": "03", "depends": []}}
+        with ExitStack() as stack:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            feeder = stack.enter_context(FakeNode(chain, txs=txs, pool=txs))
+            one = stack.enter_context(FakeNode(chain, txs=txs))
+            two = stack.enter_context(FakeNode(chain, txs=txs, pool=[parent],
+                                               tx_behavior={child: "reject", flaky: "reject"}))
+            config = config_for(feeder, [one, two])
+            config.update(mirror_mempool=True, mempool_poll_seconds=.02)
+            path = directory / "records.jsonl"
+
+            def rows(name, txid):
+                return [row for row in read_records(path)
+                        if row.get("event") == "mempool_relay"
+                        and row["target"] == name and row["txid"] == txid]
+
+            with RunningDispatcher(config, path):
+                eventually(lambda: len(one.tx_attempts) == 3 and len(two.tx_attempts) == 3)
+                self.assertLess(one.tx_attempts.index(parent), one.tx_attempts.index(child))
+                self.assertLess(two.tx_attempts.index(parent), two.tx_attempts.index(child))
+                eventually(lambda: len(rows("node-0", child)) == 1 and
+                           len(rows("node-1", child)) == 1)
+                self.assertEqual(rows("node-1", parent)[0]["outcome"], "accepted")
+                self.assertEqual(rows("node-1", child)[0]["outcome"], "rejected")
+                time.sleep(.15)
+                self.assertEqual(two.tx_attempts.count(child), 1)
+                self.assertEqual(two.tx_attempts.count(flaky), 1)
+                feeder.pool.remove(child)
+                time.sleep(.1)
+                two.tx_behavior.pop(child)
+                feeder.pool.add(child)
+                eventually(lambda: len(rows("node-1", child)) == 2)
+                self.assertEqual(rows("node-1", child)[1]["outcome"], "accepted")
+                two.tx_behavior.pop(flaky)
+                feeder.height = 1
+                eventually(lambda: len(rows("node-1", flaky)) == 2)
+                self.assertEqual(rows("node-1", flaky)[1]["outcome"], "accepted")
+
+    def test_mirror_leaves_transactions_beyond_a_full_queue_for_the_next_poll(self):
+        chain = make_chain(1)
+        txs = {f"{i:064x}": {"raw": f"0{i}", "depends": []} for i in range(1, 5)}
+        with ExitStack() as stack:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            feeder = stack.enter_context(FakeNode(chain, txs=txs, pool=txs))
+            node = stack.enter_context(FakeNode(chain, txs=txs))
+            config = config_for(feeder, [node])
+            config.update(mirror_mempool=True, mempool_poll_seconds=.02)
+            path = directory / "records.jsonl"
+            stack.enter_context(patch.object(dispatch, "MIRROR_QUEUE_SIZE", 1))
+            with RunningDispatcher(config, path):
+                eventually(lambda: sorted(node.tx_attempts) == sorted(txs))
+            relayed = [row for row in read_records(path) if row.get("event") == "mempool_relay"]
+            self.assertEqual(sorted(row["txid"] for row in relayed), sorted(txs))
+            self.assertTrue(all(row["outcome"] == "accepted" for row in relayed))
+
+    def test_long_poll_waits_for_a_slow_response_and_rearms_after_a_stalled_one(self):
+        template = {"previousblockhash": "a" * 64, "longpollid": "stall"}
+        release = threading.Event()
+        longpolls = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                params = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["params"]
+                if params:
+                    longpolls.append(params[0]["longpollid"])
+                    if params[0]["longpollid"] == "stall":
+                        release.wait(5)  # Accepted, but never answered.
+                        return
+                    time.sleep(.4)
+                payload = json.dumps({"jsonrpc": "2.0", "id": 1, "result": template,
+                                      "error": None}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(release.set)
+        rpc = dispatch.RPC({"url": f"http://127.0.0.1:{server.server_port}/"}, timeout=.2)
+        with patch.object(dispatch, "LONGPOLL_TIMEOUT_SECONDS", .6):
+            # Slower than the RPC timeout, within the long-poll bound.
+            self.assertEqual(rpc.longpoll("slow", lambda: None, lambda: None), template)
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                rpc.longpoll("stall", lambda: None, lambda: None)
+            self.assertLess(time.monotonic() - started, 2)
+            watch = TemplateWatch(lambda: rpc)
+            watch.start()
+            try:
+                eventually(lambda: longpolls.count("stall") >= 3)
+            finally:
+                watch.stop()
+
+    def test_submit_path_instrumentation_off_and_observers_never_gate_submit(self):
+        chain = make_chain(2)
+        with ExitStack() as stack:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            feeder = stack.enter_context(FakeNode(chain))
+            node = stack.enter_context(FakeNode(chain))
+            config = config_for(feeder, [node])
+            config["contestants"][0]["p2p"] = "127.0.0.1:1"
+            path = directory / "records.jsonl"
+            with RunningDispatcher(config, path):
+                feeder.height = 1
+                eventually(lambda: node.height == 1)
+            self.assertFalse(any(row["event"] == "submit_paths" for row in read_records(path)))
+            self.assertFalse(any(method == "getblockcount" for method, _ in node.calls))
+            self.assertFalse(any(row["event"] == "diagnostic" for row in read_records(path)))
+
+            path = directory / "measured.jsonl"
+            config["measure_submit_paths"] = True
+            feeder.height = 0
+            node.height = 0
+            with RunningDispatcher(config, path):
+                feeder.height = 1
+                eventually(lambda: any(row["event"] == "submit_paths"
+                                       for row in read_records(path)))
+            attempt = next(row for row in read_records(path)
+                           if row["event"] == "submitblock_call" and not row["catch_up"])
+            self.assertLess(attempt["dispatch_delay_ms"], 100)
+            self.assertEqual(attempt["outcome"], "accepted")
+            path_row = next(row for row in read_records(path) if row["event"] == "submit_paths")
+            self.assertIsNotNone(path_row["template_ms"])
+            self.assertTrue(any(method == "getblockcount" for method, _ in node.calls))
+
+    def test_tip_deadline_starts_when_submit_returns(self):
+        chain = make_chain(1)
+        with tempfile.TemporaryDirectory() as directory, FakeNode(chain) as node:
+            config = config_for(node, [node])
+            config["template_timeout_seconds"] = .05
+            dispatcher = dispatch.Dispatcher(config, Path(directory) / "records.jsonl")
+            started, finished = threading.Event(), threading.Event()
+            observed, errors = {}, []
+            watcher = threading.Thread(target=dispatcher.tip_watch,
+                                       args=({"url": node.url}, "ff" * 32, started, finished,
+                                             observed, errors))
+            try:
+                watcher.start()
+                started.set()
+                time.sleep(.1)
+                self.assertTrue(watcher.is_alive())
+                observed["returned_ns"] = time.perf_counter_ns()
+                finished.set()
+                watcher.join(.5)
+                self.assertFalse(watcher.is_alive())
+                self.assertIn("tip poll: timed out", errors)
+            finally:
+                dispatcher.stop.set()
+                finished.set()
+                watcher.join(.5)
+                dispatcher.sink.close()
 
     def test_concurrent_dispatch_and_samples(self):
         chain = make_chain(3)
@@ -317,6 +572,7 @@ class DispatchTests(unittest.TestCase):
             config["contestants"][0]["url"] += "/other"
             path.write_text(json.dumps(config))
             self.assertEqual(dispatch.load_config(path)["poll_interval_seconds"], .02)
+            self.assertIs(dispatch.load_config(path)["measure_submit_paths"], False)
             path = root / "config.toml"
             path.write_text('[feeder]\nurl = "http://127.0.0.1:1"\n'
                             '[[contestants]]\nname = "a"\nclient = "Zebra"\nversion = "test"\n'
@@ -341,8 +597,12 @@ class DispatchTests(unittest.TestCase):
                     self.assertEqual(network["network"], network_name)
                     self.assertFalse(state["ephemeral"])
                     self.assertTrue(rpc["enable_cookie_auth"])
-                    self.assertEqual(endpoint["url"], f'http://{rpc["listen_addr"]}')
-                    self.assertEqual(Path(endpoint["cookie"]), Path(rpc["cookie_dir"]) / ".cookie")
+                    if network_name == "Mainnet":
+                        self.assertEqual(endpoint["url"].rsplit(":", 1)[1], rpc["listen_addr"].rsplit(":", 1)[1])
+                        self.assertTrue(endpoint["cookie"])
+                    else:
+                        self.assertEqual(endpoint["url"], f'http://{rpc["listen_addr"]}')
+                        self.assertEqual(Path(endpoint["cookie"]), Path(rpc["cookie_dir"]) / ".cookie")
                     self.assertNotIn("auth", endpoint)
                     self.assertNotIn("pid", endpoint)  # Operators supply current process IDs.
                     for address in (network["listen_addr"], rpc["listen_addr"]):
@@ -361,13 +621,22 @@ class DispatchTests(unittest.TestCase):
                         self.assertEqual(network["initial_mainnet_peers"], [])
                         self.assertEqual(network["initial_testnet_peers"], [])
                         self.assertFalse(network["cache_dir"])
-                        self.assertTrue(network["listen_addr"].startswith("127.0.0.1:"))
+                        if network_name == "Mainnet":
+                            self.assertEqual(endpoint["p2p"].rsplit(":", 1)[1],
+                                             network["listen_addr"].rsplit(":", 1)[1])
+                        else:
+                            self.assertTrue(network["listen_addr"].startswith("127.0.0.1:"))
                     if name == "zakura":
                         self.assertEqual(network["p2p_stack"], "legacy")
                         self.assertEqual(state["storage_mode"]["pruned"]["tx_retention"], 10000)
                         bootstrap = tomllib.loads((examples / "zakura-bootstrap.toml").read_text())
-                        for key in ("state", "rpc"):
-                            self.assertEqual(bootstrap[key], node_config[key])
+                        self.assertEqual(bootstrap["state"], node_config["state"])
+                        if network_name == "Mainnet":
+                            self.assertEqual(bootstrap["rpc"]["listen_addr"], "127.0.0.1:29232")
+                            self.assertEqual({k: v for k, v in bootstrap["rpc"].items() if k != "listen_addr"},
+                                             {k: v for k, v in rpc.items() if k != "listen_addr"})
+                        else:
+                            self.assertEqual(bootstrap["rpc"], rpc)
                         self.assertEqual(bootstrap["network"]["identity_dir"], network["identity_dir"])
                         self.assertNotIn(f"initial_{network_name.lower()}_peers", bootstrap["network"])
 

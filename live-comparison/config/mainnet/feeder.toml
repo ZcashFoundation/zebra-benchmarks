@@ -1,5 +1,5 @@
 # Zebra v7.0.0 / e8db87eb69254e0d4eedd058eadd48bdfa09065a; normal Mainnet P2P.
-# Replace every /path/to path before starting the node.
+# Replace every /path/to path; firewall RPC to the dispatcher host on a trusted LAN.
 [network]
 network = "Mainnet"
 listen_addr = "0.0.0.0:18233"
@@ -10,6 +10,6 @@ cache_dir = "/path/to/live-comparison/mainnet/feeder/state"
 ephemeral = false
 
 [rpc]
-listen_addr = "127.0.0.1:18232"
+listen_addr = "0.0.0.0:18232"
 cookie_dir = "/path/to/live-comparison/mainnet/feeder/rpc"
 enable_cookie_auth = true
