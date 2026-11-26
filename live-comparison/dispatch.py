@@ -28,6 +28,10 @@ MAX_BLOCK_BYTES = 2_000_000
 MAX_RESPONSE_BYTES = 8_000_000
 MAX_MIRROR_TXIDS = 50_000
 MAX_MIRROR_HEX = 256 * 1024 * 1024
+MIRROR_QUEUE_SIZE = 10_000
+# Bounds a stalled long-poll response; TemplateWatch re-arms after it expires. Longer than all but
+# about 0.03% of 75-second block intervals.
+LONGPOLL_TIMEOUT_SECONDS = 600
 
 
 def now_ms():
@@ -97,14 +101,16 @@ class RPC:
         """Signal when the long poll is sent and when its response headers arrive."""
         url = urllib.parse.urlsplit(self.config["url"])
         connection = (http.client.HTTPSConnection if url.scheme == "https" else
-                      http.client.HTTPConnection)(url.hostname, url.port, timeout=None)
+                      http.client.HTTPConnection)(url.hostname, url.port, timeout=self.timeout)
         self._longpoll = connection
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getblocktemplate",
                            "params": [{"longpollid": longpoll_id}]}).encode()
         try:
+            # Connect within the RPC timeout, then wait for the response up to the long-poll bound.
+            connection.connect()
+            connection.sock.settimeout(LONGPOLL_TIMEOUT_SECONDS)
+            connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             connection.request("POST", url.path or "/", body, self.headers())
-            if connection.sock is not None:
-                connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             on_sent()
             response = connection.getresponse()
             on_response()
@@ -539,7 +545,7 @@ class Dispatcher:
 
     def mirror(self, _):
         nodes = self.config["contestants"]
-        channels = {node["name"]: queue.Queue(maxsize=10_000) for node in nodes}
+        channels = {node["name"]: queue.Queue(maxsize=MIRROR_QUEUE_SIZE) for node in nodes}
         status = {node["name"]: {"pending": set(), "accepted": set(), "failed": set()} for node in nodes}
         lock = threading.Lock()
         current = set()
@@ -647,11 +653,7 @@ class Dispatcher:
                                     channels[label].put_nowait((txid, raws[txid]))
                                     state["pending"].add(txid)
                                 except queue.Full:
-                                    state["failed"].add(txid)
-                                    self.sink.record({"event": "mempool_relay", "txid": txid,
-                                                      "target": label, "observed_at_unix_ms": now_ms(),
-                                                      "outcome": "error", "error": "sender queue full",
-                                                      "latency_ms": None})
+                                    break  # The rest stays eligible for the next poll, in order.
                 except (OSError, ValueError, RPCError) as error:
                     self.diagnostic("feeder mempool", error)
                 self.stop.wait(self.config["mempool_poll_seconds"])

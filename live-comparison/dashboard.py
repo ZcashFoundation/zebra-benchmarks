@@ -78,7 +78,7 @@ def rolling_means(points):
         window.append(point)
         means = []
         for i in range(3):
-            values = [p[i + 3] for p in window if p[i + 3] > 0]
+            values = [p[i + 3] for p in window if p[i + 3] is not None]
             means.append(statistics.fmean(values) if values else None)
         trend.append([point[2], *means])
     return trend

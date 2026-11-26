@@ -279,7 +279,8 @@ const document={getElementById:()=>({textContent:DATA,addEventListener:()=>{}})}
                     self.assertEqual(chart["traces"][0]["customdata"], [[0, 10], [1, 10]])
                     self.assertEqual(chart["layout"]["shapes"][0]["yref"], "paper")
                     self.assertEqual(data["glance"]["chart_start"], dashboard.utc(helper.BASE))
-                    self.assertEqual(chart["traces"][3]["y"], [5, 5, 5])
+                    # The 0 ms block has no log-axis marker but still counts in the rolling mean.
+                    self.assertEqual(chart["traces"][3]["y"], [5, 5, 10 / 3])
                     self.assertEqual(chart["traces"][5]["y"], [2, 2, 2])
                 else:
                     self.assertNotIn("range", chart["layout"]["xaxis"])
@@ -377,6 +378,8 @@ console.log(JSON.stringify([before,plots]));
         outlier = [[i, 123, i * 60_000, value, value, value]
                    for i, value in enumerate((1, 2, 100))]
         self.assertEqual(dashboard.rolling_means(outlier)[-1][1:], [103 / 3] * 3)
+        zero = [[i, 123, i * 60_000, value, value, value] for i, value in enumerate((0, 10))]
+        self.assertEqual(dashboard.rolling_means(zero)[-1][1:], [5, 5, 5])
 
     def test_glance_bin_ratios_and_savings_use_paired_full_period_values(self):
         helper = test_dispatch.DashboardTests()

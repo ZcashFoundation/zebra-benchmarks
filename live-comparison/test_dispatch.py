@@ -16,12 +16,13 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import tomllib
 
 import dashboard
 import dispatch
 import load_intervals
-from observer import MAX_MESSAGE, _messages, announcements
+from observer import MAX_MESSAGE, TemplateWatch, _messages, announcements
 
 
 def make_chain(count):
@@ -331,6 +332,69 @@ class DispatchTests(unittest.TestCase):
                 feeder.height = 1
                 eventually(lambda: len(rows("node-1", flaky)) == 2)
                 self.assertEqual(rows("node-1", flaky)[1]["outcome"], "accepted")
+
+    def test_mirror_leaves_transactions_beyond_a_full_queue_for_the_next_poll(self):
+        chain = make_chain(1)
+        txs = {f"{i:064x}": {"raw": f"0{i}", "depends": []} for i in range(1, 5)}
+        with ExitStack() as stack:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            feeder = stack.enter_context(FakeNode(chain, txs=txs, pool=txs))
+            node = stack.enter_context(FakeNode(chain, txs=txs))
+            config = config_for(feeder, [node])
+            config.update(mirror_mempool=True, mempool_poll_seconds=.02)
+            path = directory / "records.jsonl"
+            stack.enter_context(patch.object(dispatch, "MIRROR_QUEUE_SIZE", 1))
+            with RunningDispatcher(config, path):
+                eventually(lambda: sorted(node.tx_attempts) == sorted(txs))
+            relayed = [row for row in read_records(path) if row.get("event") == "mempool_relay"]
+            self.assertEqual(sorted(row["txid"] for row in relayed), sorted(txs))
+            self.assertTrue(all(row["outcome"] == "accepted" for row in relayed))
+
+    def test_long_poll_waits_for_a_slow_response_and_rearms_after_a_stalled_one(self):
+        template = {"previousblockhash": "a" * 64, "longpollid": "stall"}
+        release = threading.Event()
+        longpolls = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                params = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["params"]
+                if params:
+                    longpolls.append(params[0]["longpollid"])
+                    if params[0]["longpollid"] == "stall":
+                        release.wait(5)  # Accepted, but never answered.
+                        return
+                    time.sleep(.4)
+                payload = json.dumps({"jsonrpc": "2.0", "id": 1, "result": template,
+                                      "error": None}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(release.set)
+        rpc = dispatch.RPC({"url": f"http://127.0.0.1:{server.server_port}/"}, timeout=.2)
+        with patch.object(dispatch, "LONGPOLL_TIMEOUT_SECONDS", .6):
+            # Slower than the RPC timeout, within the long-poll bound.
+            self.assertEqual(rpc.longpoll("slow", lambda: None, lambda: None), template)
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                rpc.longpoll("stall", lambda: None, lambda: None)
+            self.assertLess(time.monotonic() - started, 2)
+            watch = TemplateWatch(lambda: rpc)
+            watch.start()
+            try:
+                eventually(lambda: longpolls.count("stall") >= 3)
+            finally:
+                watch.stop()
 
     def test_submit_path_instrumentation_off_and_observers_never_gate_submit(self):
         chain = make_chain(2)
