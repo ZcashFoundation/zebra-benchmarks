@@ -4,7 +4,7 @@ set -euo pipefail
 if [[ $# != 1 || ${1:-} == --help || ${1:-} == -h ]]; then
     cat <<'HELP'
 Usage: bash build-arm.sh BINARY_NAME
-Run inside a clean Zebra checkout. Builds locked Rust 1.97.0 release zebrad with
+Run inside a clean Zebra checkout. Builds locked release zebrad with RUSTUP_TOOLCHAIN (default 1.97.0) and
 features default-release-binaries,internal-miner. ZEBRA_EXTRA_FEATURES adds a
 comma-separated feature list (e.g. pasta-asm). BENCH_BINS selects output directory
 (default: repository-root/bins). Writes BINARY_NAME and BINARY_NAME.build.json.
@@ -25,8 +25,9 @@ cd "$(git rev-parse --show-toplevel)"
 source=$(git rev-parse HEAD)
 [[ -z $(git status --porcelain --untracked-files=no) ]] || { echo 'Dirty tracked worktree' >&2; exit 2; }
 features=default-release-binaries,internal-miner${ZEBRA_EXTRA_FEATURES:+,$ZEBRA_EXTRA_FEATURES}
-recipe="RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --release -p zebrad --features $features"
-export RUSTUP_TOOLCHAIN=1.97.0
+toolchain=${RUSTUP_TOOLCHAIN:-1.97.0}
+recipe="RUSTUP_TOOLCHAIN=$toolchain cargo build --locked --release -p zebrad --features $features"
+export RUSTUP_TOOLCHAIN=$toolchain
 cargo build --locked --release -p zebrad --features "$features"
 target=$(cargo metadata --locked --format-version 1 --no-deps |
     python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
