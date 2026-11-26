@@ -451,7 +451,7 @@ def env():
     e = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("ZEBRA", "RUST_LOG", "MALLOC_", "RAYON", "TOKIO"))
+        if not k.startswith(("ZEBRA", "ZAKURA", "RUST_LOG", "MALLOC_", "RAYON", "TOKIO"))
     }
     e.update({"NO_COLOR": "1", "TERM": "dumb", "RAYON_NUM_THREADS": "4"})
     return e
@@ -733,9 +733,17 @@ def scenario_gbtsapling(binary, out, args):
 
 
 def replay(node, chain):
+    started = time.perf_counter_ns()
     for entry in chain:
         require(node.rpc.call("submitblock", [entry["raw"]]) is None, "setup replay")
     require(node.rpc.call("getbestblockhash") == chain[-1]["hash"], "replayed parent")
+    elapsed = time.perf_counter_ns() - started
+    (node.dir / "setup-replay.json").write_text(json.dumps(dict(
+        blocks=len(chain), parent=chain[-1]["hash"],
+        elapsed_ns=elapsed,
+        seconds=elapsed / 1e9,
+        timing="submitblock replay through best-tip check; excludes process startup and template readiness",
+    ), indent=2) + "\n")
 
 
 def scenario_coldsubmit(binary, out, args):
@@ -774,9 +782,12 @@ def header_len(raw_hex):
     return 140 + width + size
 
 
-def empty_regtest_block(template):
-    """Serialize an unmodified NU5+ coinbase-only template; Regtest skips PoW."""
-    require(template["transactions"] == [], "empty template required")
+def regtest_block(template, *, solve=False, timeout=60):
+    """Serialize served NU5+ work with Regtest's 36-byte zero Equihash solution.
+
+    Both harness nodes disable Regtest PoW verification. With solve=True, also
+    search the nonce for a SHA256d hash meeting the served target (outside timing).
+    """
     roots = template["defaultroots"]
     header = struct.pack("<I", template["version"])
     for digest in (template["previousblockhash"], roots["merkleroot"],
@@ -785,8 +796,30 @@ def empty_regtest_block(template):
         require(len(raw) == 32, "32-byte template hash")
         header += raw[::-1]
     header += struct.pack("<II", template["curtime"], int(template["bits"], 16))
-    header += bytes(32) + compact(36) + bytes(36)
-    return (header + compact(1) + bytes.fromhex(template["coinbasetxn"]["data"])).hex()
+    suffix = compact(36) + bytes(36)
+    nonce = 0
+    if solve:
+        bits = int(template["bits"], 16)
+        exponent, mantissa = bits >> 24, bits & 0x7fffff
+        target = (mantissa >> (8 * (3 - exponent)) if exponent <= 3
+                  else mantissa << (8 * (exponent - 3)))
+        require(not bits & 0x800000 and 0 < target < 2**256,
+                "positive 256-bit template difficulty")
+        require(target == int(template["target"], 16), "template bits match expanded target")
+        deadline = time.monotonic() + timeout
+        while int.from_bytes(dsha(header + nonce.to_bytes(32, "little") + suffix), "little") > target:
+            require(time.monotonic() < deadline, "Regtest nonce search deadline exceeded")
+            nonce += 1
+    header += nonce.to_bytes(32, "little") + suffix
+    transactions = [template["coinbasetxn"], *template["transactions"]]
+    return (header + compact(len(transactions))
+            + b"".join(bytes.fromhex(tx["data"]) for tx in transactions)).hex()
+
+
+def empty_regtest_block(template):
+    """Serialize an unmodified NU5+ coinbase-only template; Regtest skips PoW."""
+    require(template["transactions"] == [], "empty template required")
+    return regtest_block(template)
 
 
 def load_cold_candidates(specs, producer_binary, out):

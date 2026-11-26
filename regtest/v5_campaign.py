@@ -6,6 +6,16 @@ completed/<piece>.json records only fully successful pieces. Existing pieces are
 Short post-ready workloads wait for supported Halo2 key preload (60s deadline).
 Startup RPC and sync replay retain their startup-inclusive metrics; their receipts
 record preload completion without removing that real startup cost.
+--shared-host skips the host-wide quiet gate; CPU placement remains explicit.
+--profile comparison adds 18 fresh/settled peer-to-first-work samples and three
+1.9 MB signed-transparent admission-to-template bursts per arm. Peer receivers
+are warm; first work may be coinbase-only. These controlled Regtest rows do not
+claim to reproduce the announcement's unspecified transaction/mempool setup.
+The separate served-submit piece mines initial served work after a one-second
+solve delay and first-observed rebuilt work after zero/50ms delays, without
+a proposal RPC; receipts retain admission and template-switch observations.
+Comparison defaults to CPUs 0-7,16-23; V5_CPUS=all (or empty) requires --exclusive
+after other host workloads have stopped. --shared-host never grants whole-host use.
 """
 import argparse
 import hashlib
@@ -15,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import statistics
 import subprocess
 import time
 
@@ -26,24 +37,34 @@ RUNS = Path(os.environ.get('BENCH_OUTPUT', ROOT / 'output')).expanduser().resolv
 SIGNED = Path(os.environ.get('BENCH_SIGNED_FIXTURES', ROOT / 'fixtures/transparent-signed')).expanduser().resolve()
 SOAK = Path(os.environ.get('BENCH_MAINNET', ROOT / 'mainnet')).expanduser().resolve()
 RELEASES = {'release': 'e8db87eb69254e0d4eedd058eadd48bdfa09065a',
-            'zakura-main': 'c572f8faf88e58dcaefd80ec8e4ed05f2d8643b6'}
+            'zakura-main': os.environ.get('ZAKURA_MAIN_REVISION',
+                                          'f5c20398c629c8179364b07f059da3c814af78ec')}
 LABELS = ('release', 'stack', 'crypto', 'zakura-main')
+COMPARISON_REVISIONS = {
+    'stack': '1c60fe3f00f6e5326411d786465ba540d191d709',
+    'crypto': '1c60fe3f00f6e5326411d786465ba540d191d709',
+    'zakura-main': RELEASES['zakura-main'],
+}
 SIZES = (25000, 100000, 250000, 500000, 1000000, 1500000, 1900000)
 ENDPOINTS = {'admission': 'admission-to-template', 'prepared': 'prepared-submitblock',
              'cold': 'cold-submitblock'}
 
 
-def parse_arms(specs):
+def parse_arms(specs, profile='core'):
     arms = {}
     for spec in specs:
-        if not re.fullmatch(r'(release|stack|crypto|zakura-main):(?:[A-Za-z0-9_.-]+|<binary>)', spec):
-            raise ValueError('Expected label:binary-name with a v5 label: ' + spec)
+        # Comparison runs may add `extra-NAME` Zebra arms; their sources come from build receipts.
+        labels = ('stack|crypto|zakura-main|extra-[a-z0-9-]+' if profile == 'comparison'
+                  else 'release|stack|crypto|zakura-main')
+        if not re.fullmatch(rf'({labels}):(?:[A-Za-z0-9_.-]+|<binary>)', spec):
+            raise ValueError('Expected label:binary-name for this profile: ' + spec)
         label, binary = spec.split(':')
         if label in arms:
             raise ValueError('Duplicate arm: ' + label)
         arms[label] = str(BIN / binary)
-    if not {'release', 'stack', 'crypto'} <= arms.keys():
-        raise ValueError('release, stack and crypto are required; zakura-main is optional')
+    required = set(COMPARISON_REVISIONS) if profile == 'comparison' else {'release', 'stack', 'crypto'}
+    if not required <= arms.keys():
+        raise ValueError('Required arms: ' + ', '.join(sorted(required)))
     return arms
 
 
@@ -57,8 +78,8 @@ def rotate(arms, rep):
     return items[shift:] + items[:shift]
 
 
-def plan(arms, output):
-    """Return ordered pieces: commands + estimated minutes for the four-arm comparison."""
+def plan(arms, output, profile='core'):
+    """Return ordered pieces: commands + estimated minutes for the selected comparison."""
     pieces = {}
     provenance = str(output / 'arms.json')
     zebra = {a: b for a, b in arms.items() if a != 'zakura-main'}
@@ -69,14 +90,61 @@ def plan(arms, output):
 
     def py(script, *args):
         command = ['python3', '-B', script, *map(str, args)]
-        cpus = os.environ.get('V5_CPUS')
-        return ['taskset', '-c', cpus, *command] if cpus and script != 'sync_replay.py' else command
+        cpus = os.environ.get('V5_CPUS', '0-7,16-23' if profile == 'comparison' else None)
+        return ['taskset', '-c', cpus, *command] if cpus and cpus != 'all' and script != 'sync_replay.py' else command
 
     add('smoke', [py('phase-probe.py', '--fixtures', fixtures, '--endpoint', endpoint,
                      binary, arm, fixture, 1, output / 'smoke' / fixture / endpoint / arm)
                   for fixtures, fixture in ((FIXTURES, 'empty-2000'), (SIGNED, 'transparent-signed-250000'))
                   for endpoint in ('cold-submitblock-nominer', 'warm-mempool-submitblock', 'prepared-submitblock')
                   for arm, binary in arms.items()], 15)
+
+    if profile == 'comparison':
+        for link, settle in (('fresh', 0), ('settled', 20)):
+            name = f'peer-work-{link}'
+            commands = [py('sweep/tip_to_template.py', '--fixtures', SIGNED,
+                           '--temperature', 'warm', '--settle-seconds', settle,
+                           '--poll-ms', 1, '--timeout', 1200,
+                           binary, arm, 'transparent-signed-1900000',
+                           output / name / f'{arm}-{rep + 1}')
+                        for rep in range(18) for arm, binary in rotate(arms, rep)]
+            add(name, commands, 90)
+        name = 'transparent-burst'
+        add(name, [py('sweep/run_sweep.py', *arm_flags(arms), '--provenance', provenance,
+                      '--fixtures', SIGNED, '--fixtures-subset', 'transparent-signed-1900000',
+                      '--endpoints', 'admission-to-template', '--rounds', 1, '--repetitions', 3,
+                      '--seed', 20261104, '--poll-ms', 1, '--timeout', 1200,
+                      '--output', output / name)], 35)
+        name = 'served-submit'
+        add(name, [py('sweep/run_sweep.py', *arm_flags(arms), '--provenance', provenance,
+                      '--fixtures', SIGNED, '--fixtures-subset', 'transparent-signed-1900000',
+                      '--endpoints', endpoint, '--solve-delay-seconds', delay,
+                      *(['--rebuild-observation-seconds', 2] if label != 'served' else []),
+                      '--rounds', 1, '--repetitions', 3,
+                      '--seed', 20261104, '--timeout', 1200,
+                      '--output', output / name / label)
+                   for label, endpoint, delay in (
+                       ('served', 'served-submitblock', 1),
+                       ('rebuild-0ms', 'served-rebuild-submitblock', 0),
+                       ('rebuild-50ms', 'served-rebuild-submitblock', 0.05))], 120)
+        name = 'sustained-churn'
+        add(name, [py('sweep/run_sweep.py', *arm_flags(arms), '--provenance', provenance,
+                      '--fixtures', SIGNED, '--fixtures-subset', 'transparent-signed-1900000',
+                      '--endpoints', 'sustained-churn', '--churn-rate', rate,
+                      '--churn-seconds', 60, '--churn-settle-seconds', 20, '--poll-ms', 100,
+                      '--rounds', 1, '--repetitions', 3, '--seed', 20261104, '--timeout', 1200,
+                      '--output', output / name / f'{rate}-tx-s')
+                   for rate in (20, 100)], 45)
+        if len(zebra) >= 2:
+            name = 'generate-sapling-fee'
+            add(name, [py('sweep/run_sweep.py', *arm_flags(zebra), '--provenance', provenance,
+                          '--fixtures', SIGNED, '--fixtures-subset',
+                          'transparent-signed-250000', 'transparent-signed-1900000',
+                          '--endpoints', name, '--generate-blocks', 20,
+                          '--rounds', 1, '--repetitions', 3,
+                          '--seed', 20261105, '--timeout', 1200,
+                          '--output', output / name)], 90)
+        return pieces
 
     # Nine samples per cell, retaining the v3 three-round / three-repetition design.
     # Split each endpoint and round: Zakura's 1.9 MB transparent preparation took ~647 s.
@@ -180,7 +248,9 @@ def plan(arms, output):
 
 def campaign_plan(arms, output, profile):
     """Core covers each figure; extended adds disjoint sizes/modes, not repeated core cells."""
-    full = plan(arms, output)
+    full = plan(arms, output, profile)
+    if profile == 'comparison':
+        return full
     core = {}
 
     def take(name, minutes=None):
@@ -263,7 +333,7 @@ def campaign_plan(arms, output, profile):
     return extended
 
 
-def provenance(arms):
+def provenance(arms, profile='core'):
     result = {}
     for label, binary in arms.items():
         receipt = json.loads(Path(binary + '.build.json').read_text())
@@ -275,9 +345,158 @@ def provenance(arms):
             raise ValueError('Build receipt does not match binary: ' + binary)
         if not re.fullmatch('[0-9a-f]{40}', receipt.get('source', '')) or not receipt.get('build'):
             raise ValueError('Incomplete build receipt: ' + binary)
-        if label in RELEASES and receipt['source'] != RELEASES[label]:
-            raise ValueError('Wrong release source: ' + label)
+        revisions = COMPARISON_REVISIONS if profile == 'comparison' else RELEASES
+        if label in revisions and receipt['source'] != revisions[label]:
+            raise ValueError('Wrong source revision: ' + label)
         result[label] = dict(receipt, binary_preloads=binary_preloads(str(Path(binary).resolve())))
+    return result
+
+
+def comparison_result(name, commands, arms):
+    """Summarize only complete raw rows; never substitute full-work for first-work latency."""
+    if name == 'generate-sapling-fee':
+        zebra = {arm: binary for arm, binary in arms.items() if arm != 'zakura-main'}
+        command, = commands
+        directory = Path(command[command.index('--output') + 1])
+        rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
+        fixtures = ('transparent-signed-250000', 'transparent-signed-1900000')
+        if len(rows) != 6 * len(zebra) or any(
+                row['status'] != 'ok' or row['arm'] not in zebra or row['endpoint'] != name
+                or row['fixture'] not in fixtures or row.get('generate_blocks') != 20
+                or len(row.get('generate_samples', [])) != 20
+                or row.get('standalone_getblocktemplate_calls') != 0 for row in rows):
+            raise ValueError('Incomplete or mismatched comparison rows: ' + name)
+        cells = {}
+        for fixture in fixtures:
+            result = dict(endpoint=name, fixture=fixture, unit='s', arms={},
+                          timing='median of 20 generate-1 RPC latencies per process; signed refill/admission excluded')
+            for arm in zebra:
+                selected = [row for row in rows if row['fixture'] == fixture and row['arm'] == arm]
+                if (len(selected) != 3
+                        or {(row['round'], row['repetition']) for row in selected} != {(0, i) for i in range(3)}
+                        or any(row['latency_ns'] <= 0
+                               or row['latency_ns'] != statistics.median(sample['latency_ns'] for sample in row['generate_samples'])
+                               or any(sample['fees_zat'] <= 0 or sample['transaction_count'] <= 1
+                                      or sample['end_ns'] - sample['start_ns'] != sample['latency_ns']
+                                      or sample['latency_ns'] <= 0 for sample in row['generate_samples'])
+                               for row in selected)):
+                    raise ValueError('Invalid fee-paying generation samples: ' + arm + '/' + fixture)
+                values = [row['latency_ns'] / 1e9 for row in selected]
+                result['arms'][arm] = dict(samples=3, calls_per_process=20,
+                                          median=statistics.median(values), min=min(values), max=max(values),
+                                          block_bytes=sorted({sample['block_bytes'] for row in selected
+                                                              for sample in row['generate_samples']}))
+            cells[fixture] = result
+        return dict(piece=name, cells=cells)
+    if name == 'sustained-churn':
+        if len(commands) != 2:
+            raise ValueError('Incomplete sustained-churn commands')
+        cells = {}
+        for command, rate in zip(commands, (20, 100)):
+            if (command[command.index('--endpoints') + 1] != name
+                    or float(command[command.index('--churn-rate') + 1]) != rate
+                    or float(command[command.index('--churn-seconds') + 1]) != 60):
+                raise ValueError('Mismatched sustained-churn command')
+            directory = Path(command[command.index('--output') + 1])
+            rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
+            if len(rows) != 3 * len(arms) or any(
+                    row['status'] != 'ok' or row['arm'] not in arms
+                    or row['endpoint'] != name or row['fixture'] != 'transparent-signed-1900000'
+                    or row.get('churn_rate') != rate or row.get('churn_seconds') != 60
+                    or row.get('poll_interval_ms') != 100 for row in rows):
+                raise ValueError('Incomplete or mismatched comparison rows: sustained-churn')
+            result = dict(rate_tx_s=rate, duration_seconds=60, arms={},
+                          aggregation='median/min/max of three process statistics, not pooled RPC/transaction percentiles')
+            for arm in arms:
+                selected = sorted((row for row in rows if row['arm'] == arm),
+                                  key=lambda row: row['repetition'])
+                if len(selected) != 3 or {(row['round'], row['repetition']) for row in selected} != {(0, i) for i in range(3)}:
+                    raise ValueError('Missing or duplicate sustained-churn repetitions: ' + arm)
+                metrics = {}
+                for row in selected:
+                    values = {key: row[key] for key in (
+                        'actual_admitted_rate', 'admitted_during_window', 'admission_failures',
+                        'generator_missed_admissions', 'freshness_unobserved', 'template_rebuild_count',
+                        'template_builds_per_second', 'cpu_seconds', 'cpu_seconds_per_wall_second',
+                        'peak_rss_bytes')}
+                    for key, quantiles in (
+                            ('freshness_ns', ('median', 'p90', 'max')),
+                            ('gbt_latency_ns', ('median', 'p99')),
+                            ('cheap_rpc_latency_ns', ('median', 'p99')),
+                            ('admission_start_lag_ns', ('median', 'p99', 'max'))):
+                        values.update({key + '_' + q: row[key][q] for q in quantiles})
+                    for key, value in values.items():
+                        metrics.setdefault(key, []).append(value)
+                result['arms'][arm] = dict(samples=3, metrics={
+                    key: dict(values=values,
+                              median=statistics.median(values) if None not in values else None,
+                              min=min(values) if None not in values else None,
+                              max=max(values) if None not in values else None)
+                    for key, values in metrics.items()})
+            cells[f'{rate}-tx-s'] = result
+        return dict(piece=name, cells=cells)
+    if name == 'served-submit':
+        cells = (('served', 'served-submitblock', 1),
+                 ('rebuild-0ms', 'served-rebuild-submitblock', 0),
+                 ('rebuild-50ms', 'served-rebuild-submitblock', 0.05))
+        if len(commands) != len(cells):
+            raise ValueError('Incomplete served-submit commands')
+        results = {}
+        for command, (label, endpoint, delay) in zip(commands, cells):
+            if (command[command.index('--endpoints') + 1] != endpoint
+                    or float(command[command.index('--solve-delay-seconds') + 1]) != delay):
+                raise ValueError('Mismatched served-submit command: ' + label)
+            directory = Path(command[command.index('--output') + 1])
+            rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
+            if len(rows) != 3 * len(arms) or any(
+                    row['status'] != 'ok' or row['arm'] not in arms
+                    or row['endpoint'] != endpoint or row['fixture'] != 'transparent-signed-1900000'
+                    or row.get('solve_delay_seconds') != delay for row in rows):
+                raise ValueError('Incomplete or mismatched comparison rows: ' + name + '/' + label)
+            result = dict(piece=name, endpoint=endpoint, solve_delay_seconds=delay,
+                          metric='latency_ns', unit='s', fixture='transparent-signed-1900000',
+                          arms={}, timing='submitblock request to response for a block mined from the exact served template; '
+                          'no explicit proposal RPC; preparation, observation, solve delay and mining excluded')
+            for arm in arms:
+                selected = [row for row in rows if row['arm'] == arm]
+                if len(selected) != 3 or any(row['latency_ns'] <= 0 for row in selected):
+                    raise ValueError('Missing or invalid arm samples: ' + arm + '/' + label)
+                values = [row['latency_ns'] / 1e9 for row in selected]
+                result['arms'][arm] = dict(samples=3, median=statistics.median(values),
+                                          min=min(values), max=max(values),
+                                          block_bytes=sorted({row['block_bytes'] for row in selected}),
+                                          transaction_count=sorted({row['transaction_count'] for row in selected}))
+            results[label] = result
+        return dict(piece=name, cells=results)
+    peer = name.startswith('peer-work-')
+    if peer:
+        rows = [json.loads((Path(command[-1]) / 'sample.json').read_text())
+                for command in commands]
+    else:
+        directory = Path(commands[0][commands[0].index('--output') + 1])
+        rows = [json.loads(line) for line in (directory / 'observations.jsonl').read_text().splitlines()]
+    count = 18 if peer else 3
+    metric = 'first_template_latency_ns' if peer else 'latency_ns'
+    endpoint = 'submit-to-peer-template' if peer else 'admission-to-template'
+    if len(rows) != count * len(arms) or any(
+            row['status'] != 'ok' or row['arm'] not in arms
+            or row['endpoint'] != endpoint or row['fixture'] != 'transparent-signed-1900000'
+            for row in rows):
+        raise ValueError('Incomplete or mismatched comparison rows: ' + name)
+    result = dict(piece=name, metric=metric, unit='ms' if peer else 's',
+                  fixture='transparent-signed-1900000', arms={},
+                  timing=('sender submitblock request to first receiver new-parent template response'
+                          if peer else 'start of serial transaction admission to exact full template, including matching'))
+    for arm in arms:
+        selected = [row for row in rows if row['arm'] == arm]
+        if len(selected) != count or any(row[metric] <= 0 for row in selected):
+            raise ValueError('Missing or invalid arm samples: ' + arm)
+        scale = 1e6 if peer else 1e9
+        values = [row[metric] / scale for row in selected]
+        result['arms'][arm] = dict(samples=count, median=statistics.median(values),
+                                  min=min(values), max=max(values),
+                                  block_bytes=sorted({row['block_bytes'] for row in selected}),
+                                  transaction_count=sorted({row['transaction_count'] for row in selected}))
     return result
 
 
@@ -332,7 +551,7 @@ def eta(output, queue_log, profile, now=None):
     profile = campaign.get('profile', queue_profile or profile)
     if queue_profile and queue_profile != profile:
         raise ValueError('Queue profile differs from campaign receipt')
-    arms = {label: '<binary>' for label in LABELS}
+    arms = {label: '<binary>' for label in (COMPARISON_REVISIONS if profile == 'comparison' else LABELS)}
     pieces = campaign_plan(arms, output, profile)
     names = campaign.get('pieces', list(pieces))
     estimates = {name: pieces[name][1] * 60 for name in names}
@@ -420,6 +639,9 @@ def self_test():
         else:
             raise AssertionError('invalid arms accepted')
     import tempfile
+    import io
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
     with tempfile.TemporaryDirectory() as directory:
         binary = Path(directory) / 'test-binary'
         binary.write_bytes(b'provenance test, never executed')
@@ -469,6 +691,38 @@ def self_test():
         assert 'duration: 1.000x' in report and f'Projected finish: {expected}' in report, report
         (output / 'completed/rpc.json').write_text('{')
         assert 'Ignoring incomplete receipt:' in eta(output, log, 'core', now)
+        for shared_host in (False, True):
+            run_output = Path(directory) / f'shared-{shared_host}'
+            argv = ['v5_campaign.py', '--piece', 'smoke', '--output', str(run_output), *specs]
+            if shared_host:
+                argv.append('--shared-host')
+            with patch('sys.argv', argv), patch(__name__ + '.provenance', return_value={}), \
+                    patch.object(subprocess, 'run') as run, redirect_stdout(io.StringIO()):
+                main()
+            calls = [call.args[0] for call in run.call_args_list]
+            quiet = ['bash', 'wait-quiet.sh']
+            assert (quiet in calls) == (not shared_host)
+            if not shared_host:
+                assert calls[0] == quiet
+            manifest = json.loads((run_output / 'campaign.json').read_text())
+            assert manifest.get('shared_host', False) == shared_host
+            assert ('shared_host' in manifest) == shared_host
+            with patch('sys.argv', [*argv, '--steps']), redirect_stdout(io.StringIO()) as printed:
+                main()
+            steps = [shlex.split(line) for line in printed.getvalue().splitlines() if not line.startswith('#')]
+            assert steps and all(('--shared-host' in step) == shared_host for step in steps)
+            other_mode = [arg for arg in argv if arg != '--shared-host']
+            if not shared_host:
+                other_mode.append('--shared-host')
+            with patch('sys.argv', other_mode), patch(__name__ + '.provenance', return_value={}), \
+                    patch.object(subprocess, 'run') as run, redirect_stdout(io.StringIO()):
+                try:
+                    main()
+                except ValueError as error:
+                    assert 'Campaign identity changed' in str(error)
+                else:
+                    raise AssertionError('mixed quiet/shared host campaign accepted')
+                assert not run.called
     print('v5 campaign self-test: ok')
 
 
@@ -482,8 +736,13 @@ def main():
     mode.add_argument('--eta', type=Path, metavar='OUTPUT_DIR', help='read-only progress and finish estimate')
     parser.add_argument('--queue-log', type=Path, help='supplement --eta with a local queue log')
     parser.add_argument('--piece', help='one name from --list; default runs every piece')
-    parser.add_argument('--profile', choices=('core', 'extended'), default='core')
-    parser.add_argument('--output', type=Path, help='default: BENCH_OUTPUT/v5 (or v5-extended)')
+    parser.add_argument('--profile', choices=('core', 'extended', 'comparison'), default='core')
+    parser.add_argument('--output', type=Path, help='default: BENCH_OUTPUT/v5[-PROFILE]')
+    host = parser.add_mutually_exclusive_group()
+    host.add_argument('--shared-host', action='store_true',
+                      help='skip the host-wide quiet gate for an explicitly CPU-partitioned shared host')
+    host.add_argument('--exclusive', action='store_true',
+                      help='acknowledge other host workloads are stopped; permit whole-host comparison CPUs')
     parser.add_argument('arms', nargs='*')
     args = parser.parse_args()
     if args.self_test:
@@ -497,47 +756,59 @@ def main():
         except (OSError, ValueError, KeyError) as error:
             parser.error(str(error))
         return
-    args.output = (args.output or RUNS / ('v5' if args.profile == 'core' else 'v5-extended')).resolve()
+    if args.profile == 'comparison' and not args.exclusive and os.environ.get('V5_CPUS') in ('', 'all'):
+        parser.error('Whole-host comparison CPUs require --exclusive after stopping other host workloads')
+    args.output = (args.output or RUNS / ('v5' if args.profile == 'core' else 'v5-' + args.profile)).resolve()
     try:
-        arms = parse_arms(args.arms)
+        arms = parse_arms(args.arms, args.profile)
         pieces = campaign_plan(arms, args.output, args.profile)
         if args.piece:
             pieces = {args.piece: pieces[args.piece]}
     except (ValueError, KeyError) as error:
         parser.error(str(error))
+    quiet_gate = [] if args.shared_host else [['bash', 'wait-quiet.sh']]
+    gate_note = ' (shared host; quiet gate skipped)' if args.shared_host else ' + quiet gate'
     if args.steps or args.list:
         total = sum(minutes for _, minutes in pieces.values())
         print(f'# {args.profile.upper()}: {len(pieces)} pieces; approximately {total} min '
               f'({total // 60} h {total % 60} min), excluding quiet gates and builds')
         for name, (_, minutes) in pieces.items():
             if args.list:
-                print(f'{name}\t~{minutes} min + quiet gate')
+                print(f'{name}\t~{minutes} min{gate_note}')
             else:
-                print(f'# {name}: approximately {minutes} min, excluding quiet gate')
+                print(f'# {name}: approximately {minutes} min{gate_note}')
                 print(shlex.join(['bash', str(BENCH / 'v5-campaign.sh'), '--profile', args.profile, '--piece', name,
-                      '--output', str(args.output), *args.arms]))
+                      '--output', str(args.output), *(['--shared-host'] if args.shared_host else []),
+                      *(['--exclusive'] if args.exclusive else []), *args.arms]))
         return
     environment = dict(os.environ, ZAKURA_MAIN_REVISION=RELEASES['zakura-main'])
     if not args.dry_run:
-        declared = provenance(arms)
+        declared = provenance(arms, args.profile)
         args.output.mkdir(parents=True, exist_ok=True)
         save_once(args.output / 'arms.json', declared)
         save_once(args.output / 'campaign.json', dict(
             arms=declared, profile=args.profile, pieces=list(campaign_plan(arms, args.output, args.profile)),
-            snapshot_height=2316084, replay_heights=[1750000, 1752000]))
+            **(dict(cpus=os.environ.get('V5_CPUS', '0-7,16-23') or 'all') if args.profile == 'comparison' else
+               dict(snapshot_height=2316084, replay_heights=[1750000, 1752000])),
+            **({'exclusive': True} if args.exclusive else {}),
+            **({'shared_host': True} if args.shared_host else {})))
         (args.output / 'completed').mkdir(exist_ok=True)
     for name, (commands, minutes) in pieces.items():
-        print(f'# {name}: approximately {minutes} min + quiet gate', flush=True)
+        print(f'# {name}: approximately {minutes} min{gate_note}', flush=True)
         if not args.dry_run and (args.output / 'completed' / f'{name}.json').exists():
             raise ValueError('Piece already complete; do not mix reruns: ' + name)
         if not args.dry_run and name != 'smoke' and not (args.output / 'completed/smoke.json').is_file():
             raise ValueError('Run --piece smoke successfully before measurements')
         started = time.time_ns()
-        for command in [['bash', 'wait-quiet.sh'], *commands]:
+        for command in [*quiet_gate, *commands]:
             print(shlex.join(command), flush=True)
             if not args.dry_run:
                 subprocess.run(command, cwd=BENCH, env=environment, check=True)
         if not args.dry_run:
+            if args.profile == 'comparison' and name != 'smoke':
+                summary = comparison_result(name, commands, arms)
+                save_once(args.output / name / 'summary.json', summary)
+                print(json.dumps(summary, sort_keys=True), flush=True)
             save_once(args.output / 'completed' / f'{name}.json', dict(
                 success=True, started_unix_ns=started, ended_unix_ns=time.time_ns(), commands=commands))
 

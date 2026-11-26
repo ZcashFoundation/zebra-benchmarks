@@ -4,6 +4,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -51,6 +52,7 @@ from ablation import (
     generated_fixture,
     stage1_reference,
 )
+from generate_sapling_fee import ENDPOINT as SAPLING_FEE_ENDPOINT, run as generate_sapling_fee
 
 
 # Keep in sync with zebra-chain/src/parameters/constants.rs.
@@ -295,6 +297,88 @@ def generation_case(arm, binary, directory, chain, args):
         )
 
 
+def template_changed(original, latest, *, include_time=True):
+    """Compare RPC-visible work; ignore clock-only rolls when observing a rebuild."""
+    fields = ("version", "previousblockhash", "defaultroots", "bits")
+    return (
+        latest["longpollid"] != original["longpollid"]
+        or any(latest[key] != original[key] for key in fields)
+        or (include_time and latest["curtime"] != original["curtime"])
+        or latest["coinbasetxn"]["data"] != original["coinbasetxn"]["data"]
+        or [tx["data"] for tx in latest["transactions"]]
+        != [tx["data"] for tx in original["transactions"]]
+    )
+
+
+def served_submit(node, fixture, args, *, rebuild=False):
+    """Mine exact served work, optionally observing a same-tip rebuild first."""
+    started = time.perf_counter_ns()
+    corpus = fixture["corpus"]
+    require(not rebuild or corpus, "served rebuild requires at least one fixture transaction")
+    admit(node, corpus[:-1] if rebuild else corpus)
+    template, polls = exact_template(node, corpus[:-1] if rebuild else corpus, fixture["parent"],
+                                     args.timeout, args.poll_ms / 1000)
+    served_ns = time.perf_counter_ns()
+    rebuild_receipt = {}
+    if rebuild:
+        initial = template
+        admission_start = time.perf_counter_ns()
+        admit(node, corpus[-1:])
+        admission_end = time.perf_counter_ns()
+        window = min(args.rebuild_observation_seconds, args.timeout)
+        deadline = time.monotonic() + window
+        switch_ns, rebuild_polls = None, 0
+        while time.monotonic() < deadline:
+            observed = node.rpc.call("getblocktemplate")
+            observed_ns = time.perf_counter_ns()
+            rebuild_polls += 1
+            require(observed["previousblockhash"] == fixture["parent"], "rebuild changed parent")
+            if template_changed(initial, observed, include_time=False):
+                template, switch_ns = observed, observed_ns
+                break
+            time.sleep(min(args.poll_ms / 1000, max(0, deadline - time.monotonic())))
+        served_ns = switch_ns if switch_ns is not None else time.perf_counter_ns()
+        rebuild_receipt = dict(
+            initial_template_longpollid=initial["longpollid"],
+            served_template_id="rebuilt" if switch_ns is not None else "A",
+            final_admission_start_ns=admission_start, final_admission_end_ns=admission_end,
+            template_switch_ns=switch_ns,
+            template_switch_latency_ns=None if switch_ns is None else switch_ns - admission_end,
+            observation_elapsed_ns=served_ns - admission_end,
+            rebuild_observation_seconds=window, rebuild_template_polls=rebuild_polls,
+            served_template_contains_last_transaction=any(
+                tx["hash"] == corpus[-1]["txid"] for tx in template["transactions"]),
+            rebuild_switch_detection="first changed longpoll id or work excluding clock-only rolls; otherwise original A after observation window",
+        )
+    raw = h.regtest_block(template, solve=True, timeout=args.timeout)
+    candidate = dict(raw=raw, height=template["height"], **block_identity(raw))
+    time.sleep(args.solve_delay_seconds)
+    # Observe replacement without long-polling or switching away from our served work.
+    latest = node.rpc.call("getblocktemplate")
+    require(latest["previousblockhash"] == candidate["parent"], "served work parent is still active")
+    changed = template_changed(template, latest)
+    observation = timed_submit(node, candidate)
+    accepted(node, candidate, observation.pop("reply"))
+    observation.update(
+        preparation_ns=observation["start_ns"] - started,
+        **rebuild_receipt,
+        preparation="full admission, exact served work, Regtest nonce search and solve delay; no explicit proposal; excluded from submit timer",
+        template_ready_ns=served_ns, template_polls=polls,
+        admitted_transactions=len(fixture["corpus"]),
+        template_transactions=len(template["transactions"]),
+        template_longpollid=template["longpollid"], pre_submit_longpollid=latest["longpollid"],
+        template_rebuilt_before_submit=changed,
+        template_rebuild_detection="longpoll id or serialized work changed at pre-submit poll; byte-identical internal rebuilds are not observable",
+        solve_delay_seconds=args.solve_delay_seconds,
+        solve_elapsed_ns=observation["start_ns"] - served_ns,
+        pow_solution="regtest-zero-equihash-36",
+        pow_nonce=int.from_bytes(bytes.fromhex(raw)[108:140], "little"),
+        served_block_hash=candidate["hash"], served_block_sha256=candidate["sha256"],
+        served_block_bytes=candidate["bytes"],
+    )
+    return observation
+
+
 def case(arm, binary, directory, fixture, chain, args, endpoint, *, restart_delay_seconds=None,
          prefix_state=None, prelude=None):
     if restart_delay_seconds is not None:
@@ -302,6 +386,10 @@ def case(arm, binary, directory, fixture, chain, args, endpoint, *, restart_dela
                 "restart requires a cold or finalization endpoint")
     if endpoint == GENERATE_ENDPOINT:
         return generation_case(arm, binary, directory, chain, args)
+    if endpoint == SAPLING_FEE_ENDPOINT:
+        require(arm != "zakura-main", "Zakura does not support Sapling coinbase payouts")
+        with Node(binary, directory / "node", arm, args.timeout, miner=h.SAPLING_MINER) as node:
+            return generate_sapling_fee(node, fixture, chain, args)
     if endpoint == "submit-to-peer-tip":
         with Node(binary, directory / "sender", arm, args.timeout) as sender, Node(
             binary, directory / "peer", arm, args.timeout
@@ -355,6 +443,11 @@ def case(arm, binary, directory, fixture, chain, args, endpoint, *, restart_dela
             return dict(observation, **preparation)
     with Node(binary, directory / "node", arm, args.timeout) as node:
         node.replay(chain)
+        if endpoint in ("served-submitblock", "served-rebuild-submitblock"):
+            return served_submit(node, fixture, args, rebuild=endpoint == "served-rebuild-submitblock")
+        if endpoint == "sustained-churn":
+            from sustained_churn import run
+            return run(node, fixture, args, template_changed)
         preparation_ns = None
         if endpoint in ("admission-to-template", "prepared-submitblock"):
             started = time.perf_counter_ns()
@@ -481,6 +574,8 @@ def main():
         default=ORCHARD_MINER,
         help="Orchard-only Regtest UA for the 20-block generate primary",
     )
+    parser.add_argument("--generate-blocks", type=int, default=GENERATE_BLOCKS,
+                        help="individually timed calls per generate-sapling-fee process")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--repetitions", type=int, default=3)
@@ -491,7 +586,14 @@ def main():
     )
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--poll-ms", type=float, default=1.0)
-    parser.add_argument("--endpoints", nargs="+", choices=ENDPOINTS,
+    parser.add_argument("--solve-delay-seconds", type=float, default=1.0,
+                        help="served endpoint delay after mining work, before submission (default 1; 0 and 0.05 supported)")
+    parser.add_argument("--rebuild-observation-seconds", type=float, default=2.0,
+                        help="served-rebuild-submitblock window for first replacement work before retaining A (default 2)")
+    parser.add_argument("--churn-rate", type=float, default=20, help="steady signed admissions per second")
+    parser.add_argument("--churn-seconds", type=float, default=60, help="sustained admission window")
+    parser.add_argument("--churn-settle-seconds", type=float, default=20, help="untimed post-replay settling")
+    parser.add_argument("--endpoints", nargs="+", choices=(*ENDPOINTS, "sustained-churn", SAPLING_FEE_ENDPOINT),
                         help="comparison endpoints to run; ablations keep their declared matrix")
     parser.add_argument(
         "--retry-failed",
@@ -506,9 +608,18 @@ def main():
         "succeeding only if all their endpoints have ok receipts",
     )
     args = parser.parse_args()
+    if not math.isfinite(args.solve_delay_seconds) or args.solve_delay_seconds < 0:
+        parser.error("--solve-delay-seconds must be finite and nonnegative")
+    if not math.isfinite(args.rebuild_observation_seconds) or args.rebuild_observation_seconds <= 0:
+        parser.error("--rebuild-observation-seconds must be finite and positive")
+    if (not math.isfinite(args.churn_rate) or args.churn_rate <= 0
+            or not math.isfinite(args.churn_seconds) or args.churn_seconds <= 0
+            or not math.isfinite(args.churn_settle_seconds) or args.churn_settle_seconds < 0):
+        parser.error("churn rate/duration must be finite and positive; settling finite and nonnegative")
     require(
         args.rounds >= 1
         and args.repetitions >= 1
+        and args.generate_blocks >= 1
         and args.timeout > 0
         and 0.1 <= args.poll_ms <= 100
         and (args.through_round is None or 1 <= args.through_round <= args.rounds),
@@ -684,6 +795,16 @@ def main():
         ),
         poll_interval_ms=args.poll_ms,
         timeout_seconds=args.timeout,
+        **({"solve_delay_seconds": args.solve_delay_seconds}
+           if any(endpoint.startswith("served-") for spec in specs for endpoint in spec["endpoints"]) else {}),
+        **({"rebuild_observation_seconds": args.rebuild_observation_seconds}
+           if any("served-rebuild-submitblock" in spec["endpoints"] for spec in specs) else {}),
+        **({"churn_rate": args.churn_rate, "churn_seconds": args.churn_seconds,
+            "churn_settle_seconds": args.churn_settle_seconds}
+           if any("sustained-churn" in spec["endpoints"] for spec in specs) else {}),
+        **({"sapling_fee_generate_blocks": args.generate_blocks,
+            "sapling_fee_miner": h.SAPLING_MINER}
+           if any(SAPLING_FEE_ENDPOINT in spec["endpoints"] for spec in specs) else {}),
         host=dict(
             platform=platform.platform(),
             machine=platform.machine(),
@@ -691,7 +812,7 @@ def main():
         ),
         clock=vars(time.get_clock_info("perf_counter")),
         notes=[
-            "Admission/submit/relay use identical sealed block bytes; generation uses the same sealed prefix and Orchard-only miner but real randomized proof/block bytes.",
+            "Admission/prepared/cold/relay use sealed fixture bytes. Served submission mines exact served work. Generation uses randomized proof/block bytes: Orchard-only without fees, or Sapling-only with signed fee batches refilled outside each generate timer.",
             "Every fixture/repetition/endpoint uses fresh processes and fresh state; prepared setup repeats admission without replacing its separate measurement.",
             "Cold means candidate transactions were never admitted or proposal-checked; funding replay still warms code/state. OS page caches are not flushed.",
             "Prepared is a protocol, not evidence that any implementation-specific production-PoW cache gate was reached on Regtest.",

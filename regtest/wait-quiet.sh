@@ -3,15 +3,17 @@
 set -euo pipefail
 usage() {
     cat <<'HELP'
-Usage: QUIET_DEVICE=DEVICE bash wait-quiet.sh [--device DEVICE]
+Usage: QUIET_DEVICE=DEVICE [QUIET_WRITE_MIB=20] bash wait-quiet.sh [--device DEVICE]
 DEVICE is a whole-device name under /sys/block (for example sda or nvme0n1).
 No device is guessed: select the disk hosting benchmark states and output.
 Three consecutive 60-second intervals must have disk busy time <1%, writes
-<20 MiB and one-minute system load <2. Exit 3 if not quiet within 120 intervals.
+<QUIET_WRITE_MIB MiB and one-minute system load <2. Exit 3 if not quiet within 120 intervals.
 --help prints this text without waiting. --device overrides QUIET_DEVICE.
 HELP
 }
 device=${QUIET_DEVICE:-}
+write_mib=${QUIET_WRITE_MIB:-20}
+[[ $write_mib =~ ^[0-9]+$ ]] || { echo 'QUIET_WRITE_MIB must be a whole number of MiB.' >&2; exit 2; }
 while (($#)); do
     case $1 in
         --help|-h) usage; exit 0 ;;
@@ -32,7 +34,7 @@ for ((minute=0; minute<120; minute++)); do
     read -r load _ </proc/loadavg
     busy=$((b[9] - a[9]))
     written=$(((b[6] - a[6]) * 512))
-    if ((busy >= 0 && busy < 600 && written >= 0 && written < 20*1024*1024)) && [[ ${load%%.*} -lt 2 ]]; then
+    if ((busy >= 0 && busy < 600 && written >= 0 && written < write_mib*1024*1024)) && [[ ${load%%.*} -lt 2 ]]; then
         quiet=$((quiet + 1))
     else
         quiet=0

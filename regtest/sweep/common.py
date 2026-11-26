@@ -13,14 +13,15 @@ sys.path.insert(0, str(ROOT.parent))
 import node_bench as h
 
 ARMS = ("zebra-main", "zebra-optimized", "zakura-main")
-ENDPOINTS = ("admission-to-template", "prepared-submitblock", "cold-submitblock", "submit-to-peer-tip")
+ENDPOINTS = ("admission-to-template", "prepared-submitblock", "cold-submitblock", "submit-to-peer-tip",
+             "served-submitblock", "served-rebuild-submitblock")
 # Direct-dispatch probes only: preserve the existing sweep/report matrix.
 PROBE_ENDPOINTS = ("cold-submitblock-nominer", "warm-mempool-submitblock")
 GENERATE_ENDPOINT = "generate-1-orchard-no-demand"
 GENERATE_BLOCKS = 20
 MAIN_REVISIONS = {
     "zebra-main": os.environ.get("ZEBRA_MAIN_REVISION", "e8db87eb69254e0d4eedd058eadd48bdfa09065a"),
-    "zakura-main": os.environ.get("ZAKURA_MAIN_REVISION", "c572f8faf88e58dcaefd80ec8e4ed05f2d8643b6"),
+    "zakura-main": os.environ.get("ZAKURA_MAIN_REVISION", "f5c20398c629c8179364b07f059da3c814af78ec"),
 }
 PARSER = ROOT.parent / "protocol" / "fixture.py"
 WALLET_IMAGE = "docker.io/electriccoinco/zcashd@sha256:558f41b7b8b15e1b408247914ba9ed7b9d3c62f1061823bb811b8b24a693f349"
@@ -83,9 +84,10 @@ def transaction(wallet, txid, kind):
 
 def validate_timing(row):
     require(row["latency_ns"] > 0, "strictly positive observation")
-    if row["endpoint"] == GENERATE_ENDPOINT:
+    if row["endpoint"] in (GENERATE_ENDPOINT, "generate-sapling-fee"):
         samples = row["generate_samples"]
-        require(len(samples) == GENERATE_BLOCKS, "exactly 20 measured generate calls per process")
+        expected = GENERATE_BLOCKS if row["endpoint"] == GENERATE_ENDPOINT else row["generate_blocks"]
+        require(len(samples) == expected and expected > 0, "declared measured generate calls per process")
         require(all(sample["latency_ns"] > 0
                     and sample["end_ns"] - sample["start_ns"] == sample["latency_ns"]
                     and sample["block_bytes"] > 0 for sample in samples),
@@ -98,7 +100,7 @@ def validate_timing(row):
 
 class Node(h.Node):
     def __init__(self, binary, directory, arm="zebra-main", timeout=600, miner=h.P2SH_MINER):
-        environment = {k: v for k, v in h.env().items() if not k.startswith(("NODE_", "ZAKURA"))}
+        environment = {k: v for k, v in h.env().items() if not k.startswith("NODE_")}
         environment.update(TOKIO_WORKER_THREADS="4", RAYON_NUM_THREADS="4")
         super().__init__(str(binary), directory, environment, miner=miner)
         # Select by arm, never by an arbitrarily named executable/symlink.

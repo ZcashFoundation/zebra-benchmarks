@@ -263,8 +263,8 @@ class TipTemplateTests(unittest.TestCase):
                                 transactions=[dict(hash=item['txid'], data=item['raw']) for item in self.pool])
                 assert method == 'addnode'
 
-        for temperature in ('cold', 'warm'):
-            args = SimpleNamespace(**vars(self.args), temperature=temperature, settle_seconds=0)
+        for temperature, settle in (('cold', 0), ('warm', 0), ('warm', 20)):
+            args = SimpleNamespace(**vars(self.args), temperature=temperature, settle_seconds=settle)
             result = {}
 
             def measure(sender, receiver, _fixture, _extras, _initial, _args, _directory, receipt):
@@ -275,8 +275,11 @@ class TipTemplateTests(unittest.TestCase):
 
             with tempfile.TemporaryDirectory() as directory, patch.object(probe, 'Node', FakeNode), \
                     patch.object(probe.h, 'replay'), patch.object(probe, 'measure', measure), \
-                    patch.object(probe, 'admit', lambda node, corpus: node.pool.extend(corpus)):
+                    patch.object(probe, 'admit', lambda node, corpus: node.pool.extend(corpus)), \
+                    patch.object(probe.time, 'sleep') as sleep:
                 probe.case('unused', 'test', self.fixture, [], [self.extra], args, Path(directory), result)
+                sleep.assert_called_once_with(settle)
+                self.assertGreaterEqual(result['link_age_at_submit_ns'], 0)
             self.assertEqual(result['receiver_mempool_txids'],
                              ['extra', 'mined'] if temperature == 'warm' else ['extra'])
 

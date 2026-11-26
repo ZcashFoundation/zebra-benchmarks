@@ -69,6 +69,10 @@ Exporter 0.17.2 normalizes dots to underscores, renders summaries by default, an
 appends _count/_sum:
 https://docs.rs/crate/metrics-exporter-prometheus/0.17.2/source/src/formatting.rs
 https://docs.rs/crate/metrics-exporter-prometheus/0.17.2/source/src/recorder.rs
+Zakura v1.8.1 (f5c20398c629c8179364b07f059da3c814af78ec) replaces that
+dependency with a built-in exporter, retaining the same names and cumulative
+_count/_sum summaries consumed here:
+https://github.com/zakura-core/zakura/blob/f5c20398c629c8179364b07f059da3c814af78ec/crates/zakurad/src/components/metrics/prometheus.rs
 Opted-in harnesses install SIGTERM/SIGINT and atexit cleanup for their nodes.
 Signals arriving during launch are deferred until the exact node is registered.
 The coordinator must allow 2000 seconds of cleanup for up to three profiled nodes;

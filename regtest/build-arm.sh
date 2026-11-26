@@ -9,7 +9,8 @@ features default-release-binaries,internal-miner. ZEBRA_EXTRA_FEATURES adds a
 comma-separated feature list (e.g. pasta-asm). BENCH_BINS selects output directory
 (default: repository-root/bins). Writes BINARY_NAME and BINARY_NAME.build.json.
 Reference commit: e8db87eb69254e0d4eedd058eadd48bdfa09065a
-Optimized commit: 89390f741931b5238a8ef94a86810d89b3320f1b
+Optimized comparison commit: 1c60fe3f00f6e5326411d786465ba540d191d709
+Fetch: git fetch https://github.com/ZcashFoundation/zebra bench/zakura-1.8.1-stack
 Public source: https://github.com/ZcashFoundation/zebra
 HELP
     [[ ${1:-} == --help || ${1:-} == -h ]] && exit 0
@@ -35,15 +36,26 @@ target=$(cargo metadata --locked --format-version 1 --no-deps |
 bin=$bins/$name
 install -m 755 -- "$target/release/zebrad" "$bin"
 python3 - "$bin" "$source" "$recipe" <<'PY'
-import hashlib, json, sys
+import hashlib, json, os, subprocess, sys
 from pathlib import Path
 binary, source, recipe = sys.argv[1:]
 with open(binary, 'rb') as stream:
     digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+compiler_settings = dict(
+    rustc_verbose_version=subprocess.check_output(['rustc', '-vV'], text=True).strip(),
+    environment={key: os.environ.get(key) for key in (
+        'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+        'CARGO_PROFILE_RELEASE_OPT_LEVEL', 'CARGO_PROFILE_RELEASE_LTO',
+        'CARGO_PROFILE_RELEASE_CODEGEN_UNITS', 'CARGO_PROFILE_RELEASE_DEBUG',
+        'CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS', 'CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS',
+        'CARGO_PROFILE_RELEASE_STRIP', 'CARGO_PROFILE_RELEASE_PANIC',
+        'CARGO_PROFILE_RELEASE_INCREMENTAL', 'CC', 'CXX', 'AR',
+        'CFLAGS', 'CXXFLAGS', 'CPPFLAGS', 'LDFLAGS',
+    )})
 receipt = Path(binary + '.build.json')
 temporary = receipt.with_suffix(receipt.suffix + '.tmp')
 temporary.write_text(json.dumps(dict(source=source, path=binary, sha256=digest,
-                                    build=recipe), indent=2) + '\n')
+                                    build=recipe, compiler_settings=compiler_settings), indent=2) + '\n')
 temporary.replace(receipt)
 print('BUILT', source, binary, digest)
 PY
