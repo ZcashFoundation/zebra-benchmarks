@@ -9,6 +9,7 @@ The measurements are distinct: Regtest mining paths; RPC and full-verification r
 | Directory | Purpose |
 |---|---|
 | `regtest/` | Final V5 campaign, fixture generation, node runtime, RPC and replay |
+| `crypto-ab/` | Paired cold-submitblock crypto A/B and 330-action Orchard fixture producer |
 | `initial-sync/` | Mainnet snapshot preparation, checkpoint sync and phase attribution |
 | `pruning/` | Download, extract, prune, compact and paired replay |
 | `pruning/snapshot-production/` | Separate, later snapshot-refresh workflow |
